@@ -1,0 +1,52 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Xcode - build artifacts
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+
+# Xcode - generated project (regenerated via xcodegen)
+MagpieTTS.xcodeproj/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+Packages/
+
+# CocoaPods (unused but just in case)
+Pods/
+
+# Carthage (unused but just in case)
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Large / externally-sourced artifacts (see README)
+NemoTextProcessing.xcframework/
+models/
+constants/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local tool caches
+.claude/
+.tldr/

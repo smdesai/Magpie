@@ -1,0 +1,4 @@
+module COpenJTalk {
+    header "openjtalk_wrapper.h"
+    export *
+}
