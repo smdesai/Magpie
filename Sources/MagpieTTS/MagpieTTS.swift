@@ -591,6 +591,62 @@ public final class MagpieTTS {
         return NemoTextProcessing.tnNormalizeSentence(text)
     }
 
+    // MARK: - Phoneme Span Masking
+
+    /// Replace `|...|` IPA override spans with unique alphabetic placeholders.
+    ///
+    /// Placeholders are all-letter words that carry no meaning to the NeMo TN
+    /// grammars (so they survive normalization unchanged) and contain no
+    /// whitespace or sentence punctuation (so the chunker can't cut them).
+    /// The tokenizer sees the restored `|...|` after `unmaskPhonemeSpans`.
+    /// Unterminated spans (a stray `|`) are left as literal text.
+    private static func maskPhonemeSpans(_ text: String) -> (masked: String, spans: [String]) {
+        var spans = [String]()
+        var result = ""
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            guard let open = text[cursor...].firstIndex(of: "|") else {
+                result.append(contentsOf: text[cursor...])
+                break
+            }
+            let afterOpen = text.index(after: open)
+            guard let close = text[afterOpen...].firstIndex(of: "|") else {
+                result.append(contentsOf: text[cursor...])
+                break
+            }
+            result.append(contentsOf: text[cursor ..< open])
+            spans.append(String(text[afterOpen ..< close]))
+            result.append(phonemeSpanPlaceholder(index: spans.count - 1))
+            cursor = text.index(after: close)
+        }
+        return (result, spans)
+    }
+
+    /// Restore phoneme spans that were hidden by `maskPhonemeSpans`.
+    /// Case-insensitive so TN case changes (if any) don't lose the mapping.
+    private static func unmaskPhonemeSpans(_ text: String, spans: [String]) -> String {
+        guard !spans.isEmpty else { return text }
+        var result = text
+        for (i, span) in spans.enumerated() {
+            result = result.replacingOccurrences(
+                of: phonemeSpanPlaceholder(index: i),
+                with: "|\(span)|",
+                options: .caseInsensitive)
+        }
+        return result
+    }
+
+    /// Build a unique all-letter placeholder for span index `i`.
+    private static func phonemeSpanPlaceholder(index: Int) -> String {
+        var n = index
+        var suffix = ""
+        repeat {
+            suffix.append(Character(UnicodeScalar(UInt8(97 + n % 26))))
+            n /= 26
+        } while n > 0
+        return "zmgpphon\(suffix)zmgpphon"
+    }
+
     // MARK: - Chunked Generation (Long Text)
 
     /// Split text into individual sentences for chunked generation.
@@ -774,14 +830,23 @@ public final class MagpieTTS {
     ) async throws -> GenerationResult {
         if multiTokenizer == nil { try loadTokenizer() }
 
+        // Protect |...| phoneme spans from TN and the chunker.
+        let (masked, spans) = Self.maskPhonemeSpans(text)
         // Normalize before chunking so token counts reflect expanded text
-        let normalized = Self.normalizeForTTS(text, language: language)
+        let normalized = Self.normalizeForTTS(masked, language: language)
         let chunks = try chunkText(normalized, language: language)
+        print("[IPA-DEBUG] input:      \(text)")
+        print("[IPA-DEBUG] masked:     \(masked)")
+        print("[IPA-DEBUG] spans:      \(spans)")
+        print("[IPA-DEBUG] normalized: \(normalized)")
+        print("[IPA-DEBUG] chunks:     \(chunks)")
+        print("[IPA-DEBUG] unmasked:   \(chunks.map { Self.unmaskPhonemeSpans($0, spans: spans) })")
 
         // Single chunk — use normal generate
         if chunks.count <= 1 {
             return try await generate(
-                text: normalized, language: language, options: options, progress: progress)
+                text: Self.unmaskPhonemeSpans(normalized, spans: spans),
+                language: language, options: options, progress: progress)
         }
 
         let startTime = CFAbsoluteTimeGetCurrent()
@@ -798,7 +863,8 @@ public final class MagpieTTS {
             progress?(GenerationProgress(phase: .generating(step: i, maxSteps: chunks.count)))
 
             let result = try await generate(
-                text: chunk, language: language, options: options, progress: nil)
+                text: Self.unmaskPhonemeSpans(chunk, spans: spans),
+                language: language, options: options, progress: nil)
 
             if allAudio.isEmpty {
                 allAudio = result.audioSamples
@@ -848,14 +914,17 @@ public final class MagpieTTS {
     ) async throws -> GenerationResult {
         if multiTokenizer == nil { try loadTokenizer() }
 
+        // Protect |...| phoneme spans from TN and the chunker.
+        let (masked, spans) = Self.maskPhonemeSpans(text)
         // Normalize before chunking so token counts reflect expanded text
-        let normalized = Self.normalizeForTTS(text, language: language)
+        let normalized = Self.normalizeForTTS(masked, language: language)
         let chunks = try chunkText(normalized, language: language)
 
         // Single chunk — use normal streaming
         if chunks.count <= 1 {
             return try await generateStreaming(
-                text: normalized, language: language, options: options,
+                text: Self.unmaskPhonemeSpans(normalized, spans: spans),
+                language: language, options: options,
                 chunkFrames: chunkFrames, progress: progress, onAudioChunk: onAudioChunk)
         }
 
@@ -872,7 +941,8 @@ public final class MagpieTTS {
             progress?(GenerationProgress(phase: .generating(step: i, maxSteps: chunks.count)))
 
             let result = try await generateStreaming(
-                text: chunk, language: language, options: options,
+                text: Self.unmaskPhonemeSpans(chunk, spans: spans),
+                language: language, options: options,
                 chunkFrames: chunkFrames, progress: nil, onAudioChunk: onAudioChunk)
 
             allAudio.append(contentsOf: result.audioSamples)
