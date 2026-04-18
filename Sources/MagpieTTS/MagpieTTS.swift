@@ -835,12 +835,6 @@ public final class MagpieTTS {
         // Normalize before chunking so token counts reflect expanded text
         let normalized = Self.normalizeForTTS(masked, language: language)
         let chunks = try chunkText(normalized, language: language)
-        print("[IPA-DEBUG] input:      \(text)")
-        print("[IPA-DEBUG] masked:     \(masked)")
-        print("[IPA-DEBUG] spans:      \(spans)")
-        print("[IPA-DEBUG] normalized: \(normalized)")
-        print("[IPA-DEBUG] chunks:     \(chunks)")
-        print("[IPA-DEBUG] unmasked:   \(chunks.map { Self.unmaskPhonemeSpans($0, spans: spans) })")
 
         // Single chunk — use normal generate
         if chunks.count <= 1 {
