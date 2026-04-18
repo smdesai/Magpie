@@ -1,3 +1,10 @@
+//
+//  TTSViewModel.swift
+//  MagpieTTSApp
+//
+//  Created by Sachin Desai on 3/8/26.
+//
+
 import AVFoundation
 import Combine
 import SwiftUI
@@ -103,10 +110,15 @@ final class TTSViewModel: ObservableObject {
         generationStats = nil
         progress = ""
 
+        let expandedText = PronunciationExpander.expand(
+            text, language: selectedLanguage,
+            dictionaryText: UserDefaults.standard.string(forKey: "pronunciationDictionary") ?? ""
+        )
+
         Task {
             do {
                 let result = try await tts!.generateLong(
-                    text: text,
+                    text: expandedText,
                     language: selectedLanguage,
                     options: GenerationOptions(
                         speaker: selectedVoice.id,
@@ -165,12 +177,17 @@ final class TTSViewModel: ObservableObject {
         generationStats = nil
         progress = ""
 
+        let expandedText = PronunciationExpander.expand(
+            text, language: selectedLanguage,
+            dictionaryText: UserDefaults.standard.string(forKey: "pronunciationDictionary") ?? ""
+        )
+
         Task {
             do {
                 try startStreamingEngine(sampleRate: 22050)
 
                 let result = try await tts!.generateLongStreaming(
-                    text: text,
+                    text: expandedText,
                     language: selectedLanguage,
                     options: GenerationOptions(
                         speaker: selectedVoice.id,

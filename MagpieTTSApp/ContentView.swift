@@ -1,8 +1,16 @@
+//
+//  ContentView.swift
+//  MagpieTTSApp
+//
+//  Created by Sachin Desai on 3/8/26.
+//
+
 import SwiftUI
 
 struct ContentView: View {
     @StateObject private var vm = TTSViewModel()
     @State private var showShareSheet = false
+    @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
@@ -63,8 +71,19 @@ struct ContentView: View {
                             .font(.headline)
                     }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Pronunciation settings")
+                }
             }
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showSettings) {
+                SettingsView()
+            }
         }
     }
 

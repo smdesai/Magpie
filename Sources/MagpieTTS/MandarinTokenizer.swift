@@ -1,3 +1,10 @@
+//
+//  MandarinTokenizer.swift
+//  MagpieTTS
+//
+//  Created by Sachin Desai on 3/8/26.
+//
+
 import Foundation
 
 // MARK: - Jieba Word Segmenter
