@@ -104,6 +104,22 @@ Select the `MagpieTTS` scheme and run on an iOS 17+ device or simulator.
 3. Enter text and tap **Generate**.
 4. Play back the synthesized audio or share the resulting WAV.
 
+## Custom Pronunciation (IPA Override)
+
+Wrap a word in vertical bars to bypass the phoneme dictionary and feed IPA symbols straight to the tokenizer, matching NeMo's `IPATokenizer` convention:
+
+```swift
+let result = try await tts.generate(
+    text: "I say |təˈmɑtoʊ|, you say |təˈmeɪtoʊ|."
+)
+```
+
+Write the IPA as a single contiguous string with **no internal spaces** — each Swift character becomes one
+token, mirroring how a dictionary entry is stored (e.g. `TOMATO → ['t','ə','ˈ','m','e','ɪ','ˌ','t','o','ʊ']`). Spaces inside the bars get emitted as word-separator tokens and confuse the model.
+
+Supported in all IPA-based tokenizers: English, Spanish, German, French, Italian, Vietnamese, Hindi. Not
+supported for Mandarin or Japanese (pinyin/katakana pipelines). Valid symbols are those listed as keys in the corresponding `*_token2id.json` (individual IPA characters plus stress markers `ˈ` and `ˌ`).
+
 ## Dependencies
 
 - [mlx-swift](https://github.com/ml-explore/mlx-swift) (≥ 0.30.6) — resolved via Swift Package Manager
