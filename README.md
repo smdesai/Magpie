@@ -1,4 +1,4 @@
-# Magpie TTS
+# Magpie
 
 An on-device, multilingual text-to-speech app for iOS built with SwiftUI. Magpie runs CoreML acoustic models together with an MLX-Swift local transformer to synthesize speech entirely on-device, with no network required at runtime.
 

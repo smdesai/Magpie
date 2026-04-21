@@ -31,14 +31,15 @@ targets:
     sources:
       - path: MagpieTTSApp
       - path: Sources/MagpieTTS
+      - path: Shared
       # Resources as folder references
       - path: constants
         buildPhase: resources
         type: folder
-      - path: models/Textencoder.mlmodelc
+      - path: models/TextEncoder.mlmodelc
         buildPhase: resources
         type: folder
-      - path: models/Decoderstep.mlmodelc
+      - path: models/DecoderStep.mlmodelc
         buildPhase: resources
         type: folder
       - path: models/DecoderPrefill.mlmodelc
@@ -55,6 +56,7 @@ targets:
           - MLX
           - MLXNN
           - MLXRandom
+      - target: MagpieTTSWidgets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sdesai.magpie.tts
@@ -73,3 +75,23 @@ targets:
       path: MagpieTTSApp/Info.plist
       properties:
         UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+        NSSupportsLiveActivities: true
+
+  MagpieTTSWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MagpieTTSWidgets
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sdesai.magpie.tts.widgets
+        INFOPLIST_KEY_CFBundleDisplayName: "MagpieTTS Widgets"
+        SKIP_INSTALL: YES
+    info:
+      path: MagpieTTSWidgets/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension

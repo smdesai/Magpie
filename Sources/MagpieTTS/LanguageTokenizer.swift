@@ -23,6 +23,21 @@ public enum Language: String, CaseIterable, Sendable {
     public var supportsTextInput: Bool {
         return true
     }
+
+    /// Human-readable name for UI display.
+    public var displayName: String {
+        switch self {
+        case .english: return "English"
+        case .spanish: return "Spanish"
+        case .german: return "German"
+        case .mandarin: return "Mandarin"
+        case .japanese: return "Japanese"
+        case .french: return "French"
+        case .hindi: return "Hindi"
+        case .italian: return "Italian"
+        case .vietnamese: return "Vietnamese"
+        }
+    }
 }
 
 // MARK: - Tokenizer Metadata

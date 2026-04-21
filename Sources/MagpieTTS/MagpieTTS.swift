@@ -1119,39 +1119,45 @@ public final class MagpieTTS {
         let mlCfg = MLModelConfiguration()
         mlCfg.computeUnits = computeUnits
 
-        func load(_ name: String) throws -> MLModel {
+        func load(_ name: String, computeUnit: MLComputeUnits) throws -> MLModel {
+            let cu = MLModelConfiguration()
+            cu.computeUnits = computeUnit
+
             // Prefer compiled .mlmodelc, fall back to .mlpackage
             let compiled = buildDirectory.appendingPathComponent("\(name).mlmodelc")
             if FileManager.default.fileExists(atPath: compiled.path) {
-                return try MLModel(contentsOf: compiled, configuration: mlCfg)
+                return try MLModel(contentsOf: compiled, configuration: cu)
             }
             let pkg = buildDirectory.appendingPathComponent("\(name).mlpackage")
             guard FileManager.default.fileExists(atPath: pkg.path) else {
                 throw MagpieTTSError.modelNotFound(name)
             }
             let compiledURL = try MLModel.compileModel(at: pkg)
-            return try MLModel(contentsOf: compiledURL, configuration: mlCfg)
+            return try MLModel(contentsOf: compiledURL, configuration: cu)
         }
 
-        textEncoder = try load("TextEncoder")
-        decoderStep = try load("DecoderStep")
-        nanocodec = try load("NanocodecDecoder")
+        textEncoder = try load("TextEncoder", computeUnit: .cpuAndNeuralEngine)
+        decoderStep = try load("DecoderStep", computeUnit: .cpuOnly)
+        nanocodec = try load("NanocodecDecoder", computeUnit: .cpuOnly)
 
         // Optional: batched prefill model (falls back to step loop if absent)
-        func tryLoad(_ name: String) -> MLModel? {
+        func tryLoad(_ name: String, computeUnit: MLComputeUnits) -> MLModel? {
+            let cu = MLModelConfiguration()
+            cu.computeUnits = computeUnit
+
             let compiled = buildDirectory.appendingPathComponent("\(name).mlmodelc")
             if FileManager.default.fileExists(atPath: compiled.path) {
-                return try? MLModel(contentsOf: compiled, configuration: mlCfg)
+                return try? MLModel(contentsOf: compiled, configuration: cu)
             }
             let pkg = buildDirectory.appendingPathComponent("\(name).mlpackage")
             if FileManager.default.fileExists(atPath: pkg.path),
                 let url = try? MLModel.compileModel(at: pkg)
             {
-                return try? MLModel(contentsOf: url, configuration: mlCfg)
+                return try? MLModel(contentsOf: url, configuration: cu)
             }
             return nil
         }
-        decoderPrefill = tryLoad("DecoderPrefill")
+        decoderPrefill = tryLoad("DecoderPrefill", computeUnit: .cpuAndNeuralEngine)
     }
 
     // MARK: - Private: Prefill Cache Parsing

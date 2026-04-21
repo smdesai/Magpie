@@ -6,8 +6,10 @@
 //
 
 import AVFoundation
+import ActivityKit
 import Combine
 import SwiftUI
+import UIKit
 
 struct Voice: Identifiable, Hashable {
     let id: Int
@@ -56,6 +58,19 @@ final class TTSViewModel: ObservableObject {
     private var playerNode: AVAudioPlayerNode?
     private var streamingFormat: AVAudioFormat?
     private var pendingBufferCount = 0
+    private var isInterrupted = false
+    private var interruptionObserver: NSObjectProtocol?
+    private var routeChangeObserver: NSObjectProtocol?
+    private var engineConfigObserver: NSObjectProtocol?
+    private var becameActiveObserver: NSObjectProtocol?
+
+    // Live Activity
+    private var currentActivity: Activity<TTSActivityAttributes>?
+    private var activityStartedAt = Date()
+    private var playedAudioSamples = 0
+    private var streamingSampleRate = 22050
+    private var lastActivityUpdate = Date.distantPast
+    private var lastActivityState: TTSActivityAttributes.ContentState?
 
     init() {
         let bundle = Bundle.main
@@ -126,19 +141,7 @@ final class TTSViewModel: ObservableObject {
                     )
                 ) { [weak self] prog in
                     Task { @MainActor in
-                        guard let self else { return }
-                        switch prog.phase {
-                        case .loadingModels:
-                            self.progress = "Loading models..."
-                        case .encodingText:
-                            self.progress = "Encoding text..."
-                        case .prefillingContext(let step, let total):
-                            self.progress = "Preparing voice... \(step)/\(total)"
-                        case .generating(let step, let maxSteps):
-                            self.progress = "Generating... \(step)/\(maxSteps)"
-                        case .decodingAudio:
-                            self.progress = "Decoding audio..."
-                        }
+                        self?.progress = Self.progressString(for: prog.phase)
                     }
                 }
 
@@ -182,6 +185,8 @@ final class TTSViewModel: ObservableObject {
             dictionaryText: UserDefaults.standard.string(forKey: "pronunciationDictionary") ?? ""
         )
 
+        startLiveActivity(textPreview: expandedText)
+
         Task {
             do {
                 try startStreamingEngine(sampleRate: 22050)
@@ -198,17 +203,20 @@ final class TTSViewModel: ObservableObject {
                     progress: { [weak self] prog in
                         Task { @MainActor in
                             guard let self else { return }
+                            self.progress = Self.progressString(for: prog.phase)
                             switch prog.phase {
                             case .loadingModels:
-                                self.progress = "Loading models..."
+                                self.updateLiveActivity(phase: .preparingVoice)
                             case .encodingText:
-                                self.progress = "Encoding text..."
+                                self.updateLiveActivity(phase: .encoding)
                             case .prefillingContext(let step, let total):
-                                self.progress = "Preparing voice... \(step)/\(total)"
+                                self.updateLiveActivity(
+                                    phase: .preparingVoice, step: step, maxSteps: total)
                             case .generating(let step, let maxSteps):
-                                self.progress = "Generating... \(step)/\(maxSteps)"
+                                self.updateLiveActivity(
+                                    phase: .generating, step: step, maxSteps: maxSteps)
                             case .decodingAudio:
-                                self.progress = "Decoding audio..."
+                                self.updateLiveActivity(phase: .finishing)
                             }
                         }
                     },
@@ -240,6 +248,7 @@ final class TTSViewModel: ObservableObject {
                 statusMessage = "Error"
             }
 
+            endLiveActivity()
             stopStreamingEngine()
             isGenerating = false
             isStreaming = false
@@ -272,6 +281,7 @@ final class TTSViewModel: ObservableObject {
 
     func stopStreaming() {
         // Cancel by stopping the engine; Task.checkCancellation will catch it
+        endLiveActivity()
         stopStreamingEngine()
         isStreaming = false
         isGenerating = false
@@ -298,9 +308,103 @@ final class TTSViewModel: ObservableObject {
 
     // MARK: - Streaming Engine
 
+    // MARK: - Helpers
+
+    private static func progressString(for phase: GenerationProgress.Phase) -> String {
+        switch phase {
+        case .loadingModels: return "Loading models..."
+        case .encodingText: return "Encoding text..."
+        case .prefillingContext(let s, let t): return "Preparing voice... \(s)/\(t)"
+        case .generating(let s, let m): return "Generating... \(s)/\(m)"
+        case .decodingAudio: return "Decoding audio..."
+        }
+    }
+
+    // MARK: - Live Activity
+
+    private func startLiveActivity(textPreview: String) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+            print("[TTSViewModel] Live Activities disabled by user")
+            return
+        }
+        let attributes = TTSActivityAttributes(
+            voiceName: selectedVoice.name,
+            languageName: selectedLanguage.displayName)
+        activityStartedAt = Date()
+        playedAudioSamples = 0
+        let state = TTSActivityAttributes.ContentState(
+            textPreview: String(textPreview.prefix(80)),
+            phase: .encoding, step: 0, maxSteps: 0,
+            audioElapsedSeconds: 0, startedAt: activityStartedAt)
+        do {
+            currentActivity = try Activity.request(
+                attributes: attributes,
+                content: .init(state: state, staleDate: nil))
+            lastActivityState = state
+            lastActivityUpdate = Date()
+        } catch {
+            print("[TTSViewModel] Live Activity start failed: \(error)")
+        }
+    }
+
+    /// Rate-limited update. ActivityKit throttles rapid updates (~1/sec),
+    /// so coalesce and only push when the phase changes or enough time has
+    /// passed. Always pushes on phase transitions.
+    private func updateLiveActivity(
+        phase: TTSActivityAttributes.ContentState.Phase,
+        step: Int = 0, maxSteps: Int = 0,
+        textPreview: String? = nil,
+        force: Bool = false
+    ) {
+        guard let activity = currentActivity else { return }
+        let audioElapsed = Double(playedAudioSamples) / Double(streamingSampleRate)
+        let preview = textPreview ?? lastActivityState?.textPreview ?? ""
+        let newState = TTSActivityAttributes.ContentState(
+            textPreview: preview, phase: phase,
+            step: step, maxSteps: maxSteps,
+            audioElapsedSeconds: audioElapsed,
+            startedAt: activityStartedAt)
+
+        let phaseChanged = lastActivityState?.phase != phase
+        let elapsed = Date().timeIntervalSince(lastActivityUpdate)
+        guard force || phaseChanged || elapsed > 1.0 else { return }
+
+        Task { await activity.update(.init(state: newState, staleDate: nil)) }
+        lastActivityState = newState
+        lastActivityUpdate = Date()
+    }
+
+    private func endLiveActivity() {
+        guard let activity = currentActivity else { return }
+        let finalState = TTSActivityAttributes.ContentState(
+            textPreview: lastActivityState?.textPreview ?? "",
+            phase: .done, step: lastActivityState?.step ?? 0,
+            maxSteps: lastActivityState?.maxSteps ?? 0,
+            audioElapsedSeconds: Double(playedAudioSamples) / Double(streamingSampleRate),
+            startedAt: activityStartedAt)
+        Task {
+            await activity.end(
+                .init(state: finalState, staleDate: nil),
+                dismissalPolicy: .after(Date().addingTimeInterval(3)))
+        }
+        currentActivity = nil
+        lastActivityState = nil
+    }
+
+    // MARK: - Streaming Engine
+
     private func startStreamingEngine(sampleRate: Int) throws {
-        try AVAudioSession.sharedInstance().setCategory(.playback)
-        try AVAudioSession.sharedInstance().setActive(true)
+        // `.playback` + `.spokenAudio` marks this as long-form speech.
+        // `.interruptSpokenAudioAndMixWithOthers` makes the session mixable,
+        // which is required for background reactivation after a cancelled
+        // phone call (nonmixable sessions hit
+        // AVAudioSessionErrorCode.cannotInterruptOthers). TTS still takes
+        // priority over other spoken audio (Siri, navigation, podcasts).
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(
+            .playback, mode: .spokenAudio,
+            options: [.interruptSpokenAudioAndMixWithOthers])
+        try session.setActive(true)
 
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
@@ -311,11 +415,181 @@ final class TTSViewModel: ObservableObject {
         try engine.start()
         player.play()
 
+        // Schedule a short silence buffer so there's continuous audio output
+        // from session-activate through first-generated-chunk. Without this,
+        // a slow TTFA can let the system throttle/suspend the audio route.
+        scheduleSilence(durationSeconds: 0.25, format: format, on: player)
+
         self.audioEngine = engine
         self.playerNode = player
         self.streamingFormat = format
+        self.streamingSampleRate = sampleRate
         self.pendingBufferCount = 0
         self.isPlaying = true
+
+        registerAudioSessionObservers()
+    }
+
+    private func scheduleSilence(
+        durationSeconds: Double, format: AVAudioFormat, on player: AVAudioPlayerNode
+    ) {
+        let frames = AVAudioFrameCount(Double(format.sampleRate) * durationSeconds)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        buf.frameLength = frames
+        // floatChannelData is already zeroed; nothing more to do
+        player.scheduleBuffer(buf, completionHandler: nil)
+    }
+
+    private func registerAudioSessionObservers() {
+        let nc = NotificationCenter.default
+
+        interruptionObserver = nc.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in self?.handleInterruption(note) }
+        }
+
+        routeChangeObserver = nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in self?.handleRouteChange(note) }
+        }
+
+        // Fires when hardware format changes out from under the engine (e.g.,
+        // a phone call reassigns the audio route). Deferred to `.ended` if
+        // we're currently in an interruption — the hardware isn't usable yet.
+        engineConfigObserver = nc.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleEngineConfigChange() }
+        }
+
+        // Fallback when `.ended` is never delivered (cancelled / missed calls
+        // sometimes don't post it). When the app returns to foreground and we
+        // still intend to be streaming, try to recover the audio graph.
+        becameActiveObserver = nc.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleBecameActive() }
+        }
+    }
+
+    private func unregisterAudioSessionObservers() {
+        let nc = NotificationCenter.default
+        if let obs = interruptionObserver { nc.removeObserver(obs) }
+        if let obs = routeChangeObserver { nc.removeObserver(obs) }
+        if let obs = engineConfigObserver { nc.removeObserver(obs) }
+        if let obs = becameActiveObserver { nc.removeObserver(obs) }
+        interruptionObserver = nil
+        routeChangeObserver = nil
+        engineConfigObserver = nil
+        becameActiveObserver = nil
+    }
+
+    /// Apple's documented resume pattern: reactivate session, ensure engine
+    /// is running, resume the player. No teardown, no retry ladder — Apple
+    /// explicitly recommends against rebuilding the engine during an
+    /// interruption, and `shouldResume` is only a hint. If reactivation
+    /// fails here, `didBecomeActive` is the documented fallback.
+    @discardableResult
+    private func tryResumePlayback() -> Bool {
+        guard isStreaming else { return true }
+        if let engine = audioEngine, engine.isRunning {
+            playerNode?.play()
+            return true
+        }
+
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(true)
+        } catch {
+            print("[TTSViewModel] session activate failed: \(error)")
+            return false
+        }
+        if let engine = audioEngine, !engine.isRunning {
+            do { try engine.start() } catch {
+                print("[TTSViewModel] engine start failed: \(error)")
+                return false
+            }
+        }
+        playerNode?.play()
+        print("[TTSViewModel] playback resumed")
+        return true
+    }
+
+    /// Handles real hardware/route changes (sample rate, format). Apple
+    /// explicitly says this is NOT a resume trigger — it's for rewiring
+    /// graph connections if the mainMixer's format changed. Deferred if an
+    /// interruption is active; re-syncs on `.ended`.
+    private func handleEngineConfigChange() {
+        if isInterrupted {
+            print("[TTSViewModel] config change during interruption — deferring")
+            return
+        }
+        guard let engine = audioEngine, let player = playerNode,
+            let format = streamingFormat
+        else { return }
+        print("[TTSViewModel] AVAudioEngineConfigurationChange — rewiring graph")
+        engine.disconnectNodeOutput(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        if !engine.isRunning {
+            try? engine.start()
+            if isStreaming { player.play() }
+        }
+    }
+
+    private func handleBecameActive() {
+        guard isStreaming else { return }
+        if let engine = audioEngine, engine.isRunning { return }
+        print("[TTSViewModel] didBecomeActive with engine down — resuming")
+        isInterrupted = false
+        _ = tryResumePlayback()
+    }
+
+    private func handleInterruption(_ note: Notification) {
+        guard let info = note.userInfo,
+            let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: raw)
+        else { return }
+
+        switch type {
+        case .began:
+            print("[TTSViewModel] interruption began (isStreaming=\(isStreaming))")
+            isInterrupted = true
+            playerNode?.pause()
+        case .ended:
+            let opts =
+                (info[AVAudioSessionInterruptionOptionKey] as? UInt)
+                .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+            let systemSaysResume = opts.contains(.shouldResume)
+            print(
+                "[TTSViewModel] interruption ended (shouldResume=\(systemSaysResume), "
+                    + "isStreaming=\(isStreaming))")
+            isInterrupted = false
+            // `isStreaming` is the source of truth for "should we still be
+            // playing?" — it's only cleared when the user taps Stop or the
+            // generation completes via `stopStreamingEngine`. `shouldResume`
+            // is informational (Apple's docs say it's only a hint).
+            guard isStreaming else { return }
+            _ = tryResumePlayback()
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleRouteChange(_ note: Notification) {
+        guard let info = note.userInfo,
+            let raw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
+        else { return }
+        // Pause on headphone unplug so audio doesn't blast through the speaker.
+        if reason == .oldDeviceUnavailable {
+            playerNode?.pause()
+        }
     }
 
     private func scheduleAudioChunk(_ samples: [Float]) {
@@ -330,9 +604,21 @@ final class TTSViewModel: ObservableObject {
         }
 
         pendingBufferCount += 1
+        let sampleCount = samples.count
         player.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in
-                self?.pendingBufferCount -= 1
+                guard let self else { return }
+                self.pendingBufferCount -= 1
+                self.playedAudioSamples += sampleCount
+                // Push periodic audioElapsed refreshes while the Live
+                // Activity is live (rate-limited inside).
+                if self.currentActivity != nil,
+                    let last = self.lastActivityState
+                {
+                    self.updateLiveActivity(
+                        phase: last.phase,
+                        step: last.step, maxSteps: last.maxSteps)
+                }
             }
         }
     }
@@ -352,6 +638,11 @@ final class TTSViewModel: ObservableObject {
         streamingFormat = nil
         pendingBufferCount = 0
         isPlaying = false
+
+        unregisterAudioSessionObservers()
+        // Release the audio session so music apps resume cleanly.
+        try? AVAudioSession.sharedInstance().setActive(
+            false, options: [.notifyOthersOnDeactivation])
     }
 }
 

@@ -99,7 +99,7 @@ struct ContentView: View {
                 Spacer()
                 Picker("Language", selection: $vm.selectedLanguage) {
                     ForEach(vm.languages, id: \.self) { lang in
-                        Text(displayName(for: lang)).tag(lang)
+                        Text(lang.displayName).tag(lang)
                     }
                 }
                 .pickerStyle(.menu)
@@ -288,21 +288,6 @@ struct ContentView: View {
         .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    // MARK: - Helpers
-
-    private func displayName(for lang: Language) -> String {
-        switch lang {
-        case .english: return "English"
-        case .spanish: return "Spanish"
-        case .german: return "German"
-        case .mandarin: return "Mandarin"
-        case .japanese: return "Japanese"
-        case .french: return "French"
-        case .hindi: return "Hindi"
-        case .italian: return "Italian"
-        case .vietnamese: return "Vietnamese"
-        }
-    }
 }
 
 #Preview {
