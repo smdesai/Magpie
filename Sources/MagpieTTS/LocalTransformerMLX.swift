@@ -145,10 +145,6 @@ func convertAudioEmbeddingsToMLX(_ embeddings: [[Float]], vocabSize: Int, dModel
 
 // MARK: - MLX Local Transformer Codebook Sampling (Optimized)
 
-/// Compiled forward function cache. Created lazily on first call.
-private var _compiledForward: (@Sendable (MLXArray) -> MLXArray)?
-private var _compiledForwardWeightsId: ObjectIdentifier?
-
 /// Sample 8 codebook tokens autoregressively via compiled MLX local transformer.
 /// CFG is applied at the codebook logit level (matching NeMo).
 func localTransformerSampleMLX(
@@ -170,6 +166,7 @@ func localTransformerSampleMLX(
     let dModel = 768
     let vocab = 2024
     let maxT = numCodebooks + 1  // max sequence length: 1 initial + 8 codebooks
+    var topKScratch = [Float](repeating: 0, count: vocab)
 
     let forward = makeForwardFn(weights)
 
@@ -229,8 +226,8 @@ func localTransformerSampleMLX(
         // Sample using existing CPU-based top-k with SplitMix64 for reproducibility
         codes[cb] = Int32(
             sampleTopK(
-                logits: &finalLogits, temperature: temperature,
-                topK: topK, rng: &rng))
+                logits: &finalLogits, scratch: &topKScratch,
+                temperature: temperature, topK: topK, rng: &rng))
 
         // Embed sampled token via GPU take() or CPU fallback, then project
         let idx = Int(codes[cb])

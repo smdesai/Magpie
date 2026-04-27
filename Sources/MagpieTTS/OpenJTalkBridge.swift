@@ -7,12 +7,13 @@
 
 import COpenJTalk
 import Foundation
+import os
 
 /// Swift bridge for OpenJTalk Japanese G2P frontend.
 /// Follows the NemoTextProcessing.swift pattern.
 public enum OpenJTalkBridge {
 
-    private static var isInitialized = false
+    private static let initLock = OSAllocatedUnfairLock<Bool>(initialState: false)
 
     /// NJD word feature from OpenJTalk frontend.
     struct NJDWord {
@@ -25,19 +26,20 @@ public enum OpenJTalkBridge {
     }
 
     /// Initialize OpenJTalk with the MeCab dictionary at the given path.
-    /// Idempotent — subsequent calls are no-ops.
+    /// Idempotent — subsequent calls are no-ops. Thread-safe.
     @discardableResult
     static func initialize(dictionaryPath: String) -> Bool {
-        guard !isInitialized else { return true }
-        guard let cPath = dictionaryPath.cString(using: .utf8) else { return false }
-        let result = openjtalk_init(cPath)
-        isInitialized = (result == 1)
-        return isInitialized
+        initLock.withLock { initialized in
+            guard !initialized else { return true }
+            guard let cPath = dictionaryPath.cString(using: .utf8) else { return false }
+            initialized = (openjtalk_init(cPath) == 1)
+            return initialized
+        }
     }
 
     /// Run OpenJTalk G2P frontend, returning NJD word features.
     static func runFrontend(_ text: String) -> [NJDWord]? {
-        guard isInitialized else { return nil }
+        guard initLock.withLock({ $0 }) else { return nil }
         guard let cString = text.cString(using: .utf8) else { return nil }
         guard let resultPtr = openjtalk_g2p(cString) else { return nil }
         defer { openjtalk_free_string(resultPtr) }
@@ -63,9 +65,11 @@ public enum OpenJTalkBridge {
 
     /// Release all OpenJTalk resources.
     static func cleanup() {
-        if isInitialized {
-            openjtalk_destroy()
-            isInitialized = false
+        initLock.withLock { initialized in
+            if initialized {
+                openjtalk_destroy()
+                initialized = false
+            }
         }
     }
 }

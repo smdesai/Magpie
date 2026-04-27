@@ -9,6 +9,7 @@ import Accelerate
 import CoreML
 import Foundation
 import MLX
+import os
 
 // MARK: - Public Types
 
@@ -131,21 +132,30 @@ struct ModelConfig {
     init(json: [String: Any]) throws {
         guard let dec = json["decoder"] as? [String: Any],
             let st = json["special_tokens"] as? [String: Any],
-            let inf = json["inference"] as? [String: Any]
+            let inf = json["inference"] as? [String: Any],
+            let numCodebooks = json["num_audio_codebooks"] as? Int,
+            let vocabSize = json["num_all_tokens_per_codebook"] as? Int,
+            let sampleRate = json["output_sample_rate"] as? Int,
+            let codecSamplesPerFrame = json["codec_samples_per_frame"] as? Int,
+            let audioBosId = st["audio_bos_id"] as? Int,
+            let audioEosId = st["audio_eos_id"] as? Int,
+            let dModel = dec["d_model"] as? Int,
+            let nLayers = dec["n_layers"] as? Int,
+            let nHeads = dec["sa_n_heads"] as? Int
         else {
-            throw MagpieTTSError.invalidConfiguration("Missing decoder/special_tokens/inference")
+            throw MagpieTTSError.invalidConfiguration("constants.json: missing or malformed fields")
         }
-        numCodebooks = json["num_audio_codebooks"] as! Int
-        vocabSize = json["num_all_tokens_per_codebook"] as! Int
-        sampleRate = json["output_sample_rate"] as! Int
-        codecSamplesPerFrame = json["codec_samples_per_frame"] as! Int
-        audioBosId = st["audio_bos_id"] as! Int
-        audioEosId = st["audio_eos_id"] as! Int
-        dModel = dec["d_model"] as! Int
-        nLayers = dec["n_layers"] as! Int
-        nHeads = dec["sa_n_heads"] as! Int
-        dHead = dModel / nHeads
-        minGeneratedFrames = (inf["min_generated_frames"] as? Int) ?? 4
+        self.numCodebooks = numCodebooks
+        self.vocabSize = vocabSize
+        self.sampleRate = sampleRate
+        self.codecSamplesPerFrame = codecSamplesPerFrame
+        self.audioBosId = audioBosId
+        self.audioEosId = audioEosId
+        self.dModel = dModel
+        self.nLayers = nLayers
+        self.nHeads = nHeads
+        self.dHead = dModel / nHeads
+        self.minGeneratedFrames = (inf["min_generated_frames"] as? Int) ?? 4
     }
 }
 
@@ -188,6 +198,11 @@ public final class MagpieTTS {
     private var cachedUncondCaches: [String: MLMultiArray]?
     private var cachedUncondPositions: [String: MLMultiArray]?
 
+    /// Serializes the lazy-load paths so concurrent generate() callers don't
+    /// double-load constants/models or observe partially-mutated state.
+    /// Once a loader has run, the loaded properties become write-once.
+    private let loadLock = OSAllocatedUnfairLock<Void>(initialState: ())
+
     // Decoder step I/O key mappings (from traced CoreML model variable names)
     private static let cacheOutKeys: [String] = {
         var keys = (0 ..< 11).map { "new_cache_\($0 * 2 + 1)" }
@@ -218,9 +233,11 @@ public final class MagpieTTS {
     /// Pre-load all models, constants, and tokenizer. Optional — `generate` will load lazily.
     /// Also pre-computes the unconditional CFG prefill cache (speaker/text-independent).
     public func prepare() async throws {
-        try loadConstants()
-        try loadCoreMLModels()
-        try loadTokenizer()
+        try loadLock.withLock { _ in
+            if config == nil { try loadConstants() }
+            if textEncoder == nil { try loadCoreMLModels() }
+            if multiTokenizer == nil { try loadTokenizer() }
+        }
         try precomputeUncondPrefill()
     }
 
@@ -248,7 +265,8 @@ public final class MagpieTTS {
     ///   - text: Text to synthesize.
     ///   - language: Target language (default: `.english`).
     ///   - options: Generation parameters (speaker, temperature, CFG, etc.).
-    ///   - progress: Optional callback for UI updates.
+    ///   - progress: Optional progress callback. **Invoked on a background task
+    ///     context** — dispatch to `MainActor` if updating SwiftUI state.
     /// - Returns: Audio samples, sample rate, and WAV data.
     public func generate(
         text: String,
@@ -256,8 +274,7 @@ public final class MagpieTTS {
         options: GenerationOptions = .init(),
         progress: ((GenerationProgress) -> Void)? = nil
     ) async throws -> GenerationResult {
-        if multiTokenizer == nil { try loadTokenizer() }
-        let tokenIDs = try multiTokenizer!.tokenize(text, language: language)
+        let tokenIDs = try requireTokenizer().tokenize(text, language: language)
         return try await generate(tokenIDs: tokenIDs, options: options, progress: progress)
     }
 
@@ -287,8 +304,12 @@ public final class MagpieTTS {
     ///   - language: Target language.
     ///   - options: Generation parameters.
     ///   - chunkFrames: Number of codec frames between audio chunk emissions (default 15 ≈ 0.7s).
-    ///   - progress: Optional callback for UI updates.
-    ///   - onAudioChunk: Called with (newSamples, sampleRate) for each decoded chunk.
+    ///   - progress: Optional progress callback. **Invoked on a background task
+    ///     context** — dispatch to `MainActor` if updating SwiftUI state.
+    ///   - onAudioChunk: Called with `(newSamples, sampleRate)` for each decoded
+    ///     chunk. **Invoked on a background task context.** Audio playback engines
+    ///     like AVAudioEngine accept buffers from any thread; SwiftUI consumers
+    ///     must dispatch to `MainActor` themselves.
     /// - Returns: Complete generation result.
     public func generateStreaming(
         text: String,
@@ -298,11 +319,42 @@ public final class MagpieTTS {
         progress: ((GenerationProgress) -> Void)? = nil,
         onAudioChunk: @escaping ([Float], Int) -> Void
     ) async throws -> GenerationResult {
-        if multiTokenizer == nil { try loadTokenizer() }
-        let tokenIDs = try multiTokenizer!.tokenize(text, language: language)
+        let tokenIDs = try requireTokenizer().tokenize(text, language: language)
         return try await generateInternal(
             tokenIDs: tokenIDs, options: options, chunkFrames: chunkFrames,
             progress: progress, onAudioChunk: onAudioChunk)
+    }
+
+    // MARK: - Lazy-Load Helpers
+
+    private func requireTokenizer() throws -> MultiLanguageTokenizer {
+        try loadLock.withLock { _ in
+            if multiTokenizer == nil { try loadTokenizer() }
+            guard let tok = multiTokenizer else {
+                throw MagpieTTSError.generationFailed("Tokenizer failed to load")
+            }
+            return tok
+        }
+    }
+
+    private func requireConfig() throws -> ModelConfig {
+        try loadLock.withLock { _ in
+            if config == nil { try loadConstants() }
+            guard let cfg = config else {
+                throw MagpieTTSError.generationFailed("Config failed to load")
+            }
+            return cfg
+        }
+    }
+
+    /// Ensure constants and CoreML models are loaded. Safe to call concurrently —
+    /// only one loader runs at a time, and subsequent callers observe the loaded
+    /// state.
+    private func ensureLoaded() throws {
+        try loadLock.withLock { _ in
+            if config == nil { try loadConstants() }
+            if textEncoder == nil { try loadCoreMLModels() }
+        }
     }
 
     // MARK: - Internal Generation Pipeline
@@ -319,10 +371,16 @@ public final class MagpieTTS {
         progress: ((GenerationProgress) -> Void)? = nil,
         onAudioChunk: (([Float], Int) -> Void)? = nil
     ) async throws -> GenerationResult {
-        if config == nil { try loadConstants() }
-        if textEncoder == nil { try loadCoreMLModels() }
+        try ensureLoaded()
 
-        let cfg = config!
+        guard let cfg = config,
+            let encoder = textEncoder,
+            let speakers = speakerEmbeddings,
+            let audioEmbs = audioEmbeddings,
+            let ltW = ltWeights
+        else {
+            throw MagpieTTSError.generationFailed("Models or constants not loaded")
+        }
         let maxTextLen = 256
         let maxSeqLen = 512
         let maxCodecFrames = 256
@@ -342,12 +400,15 @@ public final class MagpieTTS {
         let tokensArr = try int32Array(tokensBuf, shape: [1, maxTextLen])
         let maskArr = try floatArray(maskBuf, shape: [1, maxTextLen])
 
-        let encResult = try await textEncoder!.prediction(
+        let encResult = try await encoder.prediction(
             from: MLDictionaryFeatureProvider(dictionary: [
                 "text_tokens": MLFeatureValue(multiArray: tokensArr),
                 "text_mask": MLFeatureValue(multiArray: maskArr),
             ]))
-        let encoderOutput = encResult.featureValue(for: "encoder_output")!.multiArrayValue!
+        guard let encoderOutput = encResult.featureValue(for: "encoder_output")?.multiArrayValue
+        else {
+            throw MagpieTTSError.generationFailed("TextEncoder missing encoder_output")
+        }
 
         let uncondEncOut: MLMultiArray?
         let uncondMask: MLMultiArray?
@@ -380,7 +441,11 @@ public final class MagpieTTS {
         var (caches, positions) = try makeCaches()
 
         // ---- 3. Prefill speaker context ----
-        let spkEmb = speakerEmbeddings![options.speaker]
+        guard options.speaker < speakers.count else {
+            throw MagpieTTSError.invalidConfiguration(
+                "speaker \(options.speaker) out of range (have \(speakers.count))")
+        }
+        let spkEmb = speakers[options.speaker]
         let tCtx = speakerContextLength
         var uCaches = [String: MLMultiArray]()
         var uPositions = [String: MLMultiArray]()
@@ -492,9 +557,13 @@ public final class MagpieTTS {
             let ltStart = CFAbsoluteTimeGetCurrent()
             let nextCodes: [Int32]
             if useMLXLocalTransformer {
+                guard let ltWMLX = ltWeightsMLX else {
+                    throw MagpieTTSError.generationFailed(
+                        "MLX local transformer weights not loaded")
+                }
                 nextCodes = localTransformerSampleMLX(
-                    decoderHidden: condFloats, weights: ltWeightsMLX!,
-                    audioEmbeddings: audioEmbeddings!, audioEmbeddingsMLX: audioEmbeddingsMLX,
+                    decoderHidden: condFloats, weights: ltWMLX,
+                    audioEmbeddings: audioEmbs, audioEmbeddingsMLX: audioEmbeddingsMLX,
                     numCodebooks: numCb,
                     temperature: options.temperature, topK: options.topK,
                     forbidEOS: forbidEOS, uncondDecoderHidden: uncondFloats,
@@ -502,8 +571,8 @@ public final class MagpieTTS {
                 )
             } else {
                 nextCodes = localTransformerSample(
-                    decoderHidden: condFloats, weights: ltWeights!,
-                    audioEmbeddings: audioEmbeddings!, numCodebooks: numCb,
+                    decoderHidden: condFloats, weights: ltW,
+                    audioEmbeddings: audioEmbs, numCodebooks: numCb,
                     temperature: options.temperature, topK: options.topK,
                     forbidEOS: forbidEOS, uncondDecoderHidden: uncondFloats,
                     cfgScale: options.cfgScale, rng: &rng
@@ -656,6 +725,14 @@ public final class MagpieTTS {
 
     // MARK: - Chunked Generation (Long Text)
 
+    /// Sentence boundary regex.
+    /// - Latin: split after `.!?` followed by whitespace and an uppercase letter.
+    /// - CJK: split after `。！？`.
+    /// Uses NSRegularExpression because Swift Regex literals don't support
+    /// lookbehind on this toolchain.
+    private static let sentenceBoundary = try! NSRegularExpression(
+        pattern: #"(?<=[.!?])\s+(?=[A-Z])|(?<=[。！？])"#)
+
     /// Split text into individual sentences for chunked generation.
     /// Each sentence is generated independently to avoid the model hitting EOS
     /// before vocalizing all text in a chunk.
@@ -664,38 +741,15 @@ public final class MagpieTTS {
     private func chunkText(_ text: String, language: Language) throws -> [String] {
         let maxTokens = 240  // Leave margin below maxTextLen=256
 
-        // Split on sentence-ending punctuation.
-        // For Latin: split after .!? followed by whitespace and uppercase letter.
-        // For CJK: split after 。！？ (Chinese/Japanese sentence-ending punctuation).
-        let pattern = #"(?<=[.!?])\s+(?=[A-Z])|(?<=[。！？])"#
         let sentences = text.components(separatedBy: .newlines)
-            .flatMap { line -> [String] in
-                guard let regex = try? NSRegularExpression(pattern: pattern) else {
-                    return [line]
-                }
-                let nsLine = line as NSString
-                var parts = [String]()
-                var lastEnd = 0
-                let matches = regex.matches(
-                    in: line, range: NSRange(location: 0, length: nsLine.length))
-                for match in matches {
-                    let range = NSRange(location: lastEnd, length: match.range.location - lastEnd)
-                    let s = nsLine.substring(with: range).trimmingCharacters(
-                        in: .whitespacesAndNewlines)
-                    if !s.isEmpty { parts.append(s) }
-                    lastEnd = match.range.location + match.range.length
-                }
-                let remainder = nsLine.substring(from: lastEnd).trimmingCharacters(
-                    in: .whitespacesAndNewlines)
-                if !remainder.isEmpty { parts.append(remainder) }
-                return parts
+            .flatMap { line in
+                Self.splitOn(line, regex: Self.sentenceBoundary)
             }
-            .filter { !$0.isEmpty }
 
         // Second pass: split sentences that exceed the token limit
         var result = [String]()
         for sentence in (sentences.isEmpty ? [text] : sentences) {
-            let tokens = try multiTokenizer!.tokenize(sentence, language: language)
+            let tokens = try requireTokenizer().tokenize(sentence, language: language)
             if tokens.count <= maxTokens {
                 result.append(sentence)
             } else {
@@ -709,64 +763,68 @@ public final class MagpieTTS {
         return result.isEmpty ? [text] : result
     }
 
+    /// Clause boundary regex (Latin + CJK comma/semicolon).
+    /// NSRegularExpression because Swift Regex literals don't support lookbehind here.
+    private static let clauseBoundary = try! NSRegularExpression(
+        pattern: #"(?<=[,;,;、])\s*"#)
+
+    /// Split `text` at every match of `regex`, trim, and drop empties.
+    private static func splitOn(_ text: String, regex: NSRegularExpression) -> [String] {
+        let nsText = text as NSString
+        let matches = regex.matches(
+            in: text, range: NSRange(location: 0, length: nsText.length))
+        var parts = [String]()
+        var lastEnd = 0
+        for match in matches {
+            let r = NSRange(location: lastEnd, length: match.range.location - lastEnd)
+            let s = nsText.substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !s.isEmpty { parts.append(s) }
+            lastEnd = match.range.location + match.range.length
+        }
+        let tail = nsText.substring(from: lastEnd).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { parts.append(tail) }
+        return parts
+    }
+
     /// Split a chunk that exceeds the token limit on clause boundaries, then word boundaries.
     private func splitLongChunk(_ text: String, language: Language, maxTokens: Int) throws
         -> [String]
     {
-        // Try splitting on commas/semicolons (Latin and CJK)
-        let clausePattern = #"(?<=[,;，；、])\s*"#
-        if let regex = try? NSRegularExpression(pattern: clausePattern) {
-            let nsText = text as NSString
-            let matches = regex.matches(
-                in: text, range: NSRange(location: 0, length: nsText.length))
-            if !matches.isEmpty {
-                var clauses = [String]()
-                var lastEnd = 0
-                for match in matches {
-                    let range = NSRange(location: lastEnd, length: match.range.location - lastEnd)
-                    let s = nsText.substring(with: range).trimmingCharacters(
-                        in: .whitespacesAndNewlines)
-                    if !s.isEmpty { clauses.append(s) }
-                    lastEnd = match.range.location + match.range.length
+        let clauses = Self.splitOn(text, regex: Self.clauseBoundary)
+        if clauses.count > 1 {
+            // Group clauses to fit within token limit
+            var grouped = [String]()
+            var current = ""
+            for clause in clauses {
+                let candidate = current.isEmpty ? clause : "\(current) \(clause)"
+                let tokens = try requireTokenizer().tokenize(candidate, language: language)
+                if tokens.count <= maxTokens {
+                    current = candidate
+                } else {
+                    if !current.isEmpty { grouped.append(current) }
+                    current = clause
                 }
-                let remainder = nsText.substring(from: lastEnd).trimmingCharacters(
-                    in: .whitespacesAndNewlines)
-                if !remainder.isEmpty { clauses.append(remainder) }
+            }
+            if !current.isEmpty { grouped.append(current) }
 
-                // Group clauses to fit within token limit
-                var grouped = [String]()
-                var current = ""
-                for clause in clauses {
-                    let candidate = current.isEmpty ? clause : "\(current) \(clause)"
-                    let tokens = try multiTokenizer!.tokenize(candidate, language: language)
+            // If grouping helped, return; otherwise fall through to word splitting
+            let firstGroupTokenCount = try requireTokenizer().tokenize(
+                grouped[0], language: language
+            ).count
+            if grouped.count > 1 || firstGroupTokenCount <= maxTokens {
+                // Recursively check each group
+                var final = [String]()
+                for g in grouped {
+                    let tokens = try requireTokenizer().tokenize(g, language: language)
                     if tokens.count <= maxTokens {
-                        current = candidate
+                        final.append(g)
                     } else {
-                        if !current.isEmpty { grouped.append(current) }
-                        current = clause
+                        final.append(
+                            contentsOf: try splitOnWords(
+                                g, language: language, maxTokens: maxTokens))
                     }
                 }
-                if !current.isEmpty { grouped.append(current) }
-
-                // If grouping helped, return; otherwise fall through to word splitting
-                let firstGroupTokenCount = try multiTokenizer!.tokenize(
-                    grouped[0], language: language
-                ).count
-                if grouped.count > 1 || firstGroupTokenCount <= maxTokens {
-                    // Recursively check each group
-                    var final = [String]()
-                    for g in grouped {
-                        let tokens = try multiTokenizer!.tokenize(g, language: language)
-                        if tokens.count <= maxTokens {
-                            final.append(g)
-                        } else {
-                            final.append(
-                                contentsOf: try splitOnWords(
-                                    g, language: language, maxTokens: maxTokens))
-                        }
-                    }
-                    return final
-                }
+                return final
             }
         }
 
@@ -785,7 +843,7 @@ public final class MagpieTTS {
         while lo < hi {
             let mid = (lo + hi + 1) / 2
             let candidate = words[0 ..< mid].joined(separator: " ")
-            let tokens = try multiTokenizer!.tokenize(candidate, language: language)
+            let tokens = try requireTokenizer().tokenize(candidate, language: language)
             if tokens.count <= maxTokens {
                 lo = mid
             } else {
@@ -800,7 +858,7 @@ public final class MagpieTTS {
 
         // Recursively split the remainder
         var result = [first]
-        let restTokens = try multiTokenizer!.tokenize(rest, language: language)
+        let restTokens = try requireTokenizer().tokenize(rest, language: language)
         if restTokens.count <= maxTokens {
             result.append(rest)
         } else {
@@ -835,7 +893,7 @@ public final class MagpieTTS {
         options: GenerationOptions = .init(),
         progress: ((GenerationProgress) -> Void)? = nil
     ) async throws -> GenerationResult {
-        if multiTokenizer == nil { try loadTokenizer() }
+        _ = try requireTokenizer()  // ensure tokenizer is loaded for chunkText
 
         // Protect |...| phoneme spans from TN and the chunker.
         let (masked, spans) = Self.maskPhonemeSpans(text)
@@ -857,7 +915,10 @@ public final class MagpieTTS {
         var totalCodecTime: Double = 0
         var totalLTTime: Double = 0
         var totalDecoderCalls = 0
-        let overlapSamples = config!.sampleRate / 10  // 100ms crossfade
+        guard let cfg = config else {
+            throw MagpieTTSError.generationFailed("Config not loaded")
+        }
+        let overlapSamples = cfg.sampleRate / 10  // 100ms crossfade
 
         for (i, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
@@ -890,7 +951,7 @@ public final class MagpieTTS {
 
         return GenerationResult(
             audioSamples: allAudio,
-            sampleRate: config!.sampleRate,
+            sampleRate: cfg.sampleRate,
             framesGenerated: totalFrames,
             generationTimeSeconds: CFAbsoluteTimeGetCurrent() - startTime,
             decoderTimeSeconds: totalDecoderTime,
@@ -913,7 +974,7 @@ public final class MagpieTTS {
         progress: ((GenerationProgress) -> Void)? = nil,
         onAudioChunk: @escaping ([Float], Int) -> Void
     ) async throws -> GenerationResult {
-        if multiTokenizer == nil { try loadTokenizer() }
+        _ = try requireTokenizer()  // ensure tokenizer is loaded for chunkText
 
         // Protect |...| phoneme spans from TN and the chunker.
         let (masked, spans) = Self.maskPhonemeSpans(text)
@@ -956,7 +1017,7 @@ public final class MagpieTTS {
 
         return GenerationResult(
             audioSamples: allAudio,
-            sampleRate: config!.sampleRate,
+            sampleRate: try requireConfig().sampleRate,
             framesGenerated: totalFrames,
             generationTimeSeconds: CFAbsoluteTimeGetCurrent() - startTime,
             decoderTimeSeconds: totalDecoderTime,
@@ -972,6 +1033,9 @@ public final class MagpieTTS {
     private func decodeFrames(
         _ predictions: [[Int32]], numCb: Int, maxCodecFrames: Int, cfg: ModelConfig
     ) throws -> [Float] {
+        guard let codec = nanocodec else {
+            throw MagpieTTSError.generationFailed("Nanocodec not loaded")
+        }
         let numFrames = min(predictions.count, maxCodecFrames)
         var codecBuf = [Int32](repeating: 0, count: numCb * maxCodecFrames)
         for t in 0 ..< numFrames {
@@ -980,7 +1044,7 @@ public final class MagpieTTS {
             }
         }
 
-        let codecResult = try nanocodec!.prediction(
+        let codecResult = try codec.prediction(
             from: MLDictionaryFeatureProvider(dictionary: [
                 "tokens": MLFeatureValue(
                     multiArray: try int32Array(codecBuf, shape: [1, numCb, maxCodecFrames]))
@@ -988,7 +1052,10 @@ public final class MagpieTTS {
             options: MLPredictionOptions()
         )
 
-        var audio = readFloats(codecResult.featureValue(for: "audio")!.multiArrayValue!)
+        guard let audioArr = codecResult.featureValue(for: "audio")?.multiArrayValue else {
+            throw MagpieTTSError.generationFailed("Nanocodec missing audio output")
+        }
+        var audio = readFloats(audioArr)
         let expected = numFrames * cfg.codecSamplesPerFrame
         if audio.count > expected { audio = Array(audio.prefix(expected)) }
         return audio
@@ -1002,23 +1069,35 @@ public final class MagpieTTS {
         guard FileManager.default.fileExists(atPath: jsonURL.path) else {
             throw MagpieTTSError.constantsNotFound(jsonURL.path)
         }
-        let json =
-            try JSONSerialization.jsonObject(with: Data(contentsOf: jsonURL)) as! [String: Any]
-        config = try ModelConfig(json: json)
+        guard
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: jsonURL))
+                as? [String: Any]
+        else {
+            throw MagpieTTSError.invalidConfiguration("constants.json: malformed root")
+        }
+        let cfg = try ModelConfig(json: json)
+        config = cfg
 
         // Speaker embeddings
         let siURL = cDir.appendingPathComponent("speaker_info.json")
-        let si = try JSONSerialization.jsonObject(with: Data(contentsOf: siURL)) as! [String: Any]
-        let numSpeakers = si["num_speakers"] as! Int
-        speakerContextLength = si["T"] as! Int
+        guard
+            let si = try JSONSerialization.jsonObject(with: Data(contentsOf: siURL))
+                as? [String: Any],
+            let numSpeakers = si["num_speakers"] as? Int,
+            let tCtx = si["T"] as? Int
+        else {
+            throw MagpieTTSError.invalidConfiguration("speaker_info.json: malformed")
+        }
+        speakerContextLength = tCtx
         speakerEmbeddings = try (0 ..< numSpeakers).map {
             try NpyReader.load(url: cDir.appendingPathComponent("speaker_\($0).npy")).data
         }
 
         // Audio code embeddings
-        audioEmbeddings = try (0 ..< config!.numCodebooks).map {
+        let embs = try (0 ..< cfg.numCodebooks).map {
             try NpyReader.load(url: cDir.appendingPathComponent("audio_embedding_\($0).npy")).data
         }
+        audioEmbeddings = embs
 
         // Local transformer weights
         ltWeights = try LocalTransformerWeights.load(
@@ -1028,9 +1107,8 @@ public final class MagpieTTS {
 
         // Pre-convert audio embeddings to MLXArray for GPU-side lookup
         let vocabSize = 2024  // audio codebook vocab size
-        let dModel = config!.dModel
         audioEmbeddingsMLX = convertAudioEmbeddingsToMLX(
-            audioEmbeddings!, vocabSize: vocabSize, dModel: dModel)
+            embs, vocabSize: vocabSize, dModel: cfg.dModel)
     }
 
     private func loadTokenizer() throws {
@@ -1041,7 +1119,9 @@ public final class MagpieTTS {
     /// The unconditional path uses zero audio + zero encoder output, so it's identical
     /// across all text inputs and speakers. Computing it once saves tCtx decoder calls per generation.
     private func precomputeUncondPrefill() throws {
-        let cfg = config!
+        guard let cfg = config else {
+            throw MagpieTTSError.generationFailed("Config not loaded")
+        }
         let maxTextLen = 256
         let maxSeqLen = 512
         let nL = cfg.nLayers
@@ -1207,39 +1287,55 @@ public final class MagpieTTS {
 
     // MARK: - Private: Decoder Step
 
-    @discardableResult
     private func runDecoder(
         audio: MLMultiArray, enc: MLMultiArray, mask: MLMultiArray,
         caches: inout [String: MLMultiArray], positions: inout [String: MLMultiArray]
     ) throws -> MLMultiArray {
+        guard let cfg = config, let decoder = decoderStep else {
+            throw MagpieTTSError.generationFailed("Decoder not loaded")
+        }
         var dict: [String: MLFeatureValue] = [
             "audio_embed": MLFeatureValue(multiArray: audio),
             "encoder_output": MLFeatureValue(multiArray: enc),
             "encoder_mask": MLFeatureValue(multiArray: mask),
         ]
-        for i in 0 ..< config!.nLayers {
-            dict["cache\(i)"] = MLFeatureValue(multiArray: caches["cache\(i)"]!)
-            dict["position\(i)"] = MLFeatureValue(multiArray: positions["position\(i)"]!)
+        for i in 0 ..< cfg.nLayers {
+            guard let cache = caches["cache\(i)"], let position = positions["position\(i)"] else {
+                throw MagpieTTSError.generationFailed("Missing KV cache for layer \(i)")
+            }
+            dict["cache\(i)"] = MLFeatureValue(multiArray: cache)
+            dict["position\(i)"] = MLFeatureValue(multiArray: position)
         }
         let provider = try MLDictionaryFeatureProvider(dictionary: dict)
-        let out = try decoderStep!.prediction(from: provider, options: MLPredictionOptions())
-        for i in 0 ..< config!.nLayers {
-            caches["cache\(i)"] = out.featureValue(for: Self.cacheOutKeys[i])!.multiArrayValue!
-            positions["position\(i)"] = out.featureValue(for: Self.posOutKeys[i])!.multiArrayValue!
+        let out = try decoder.prediction(from: provider, options: MLPredictionOptions())
+        for i in 0 ..< cfg.nLayers {
+            guard let newCache = out.featureValue(for: Self.cacheOutKeys[i])?.multiArrayValue,
+                let newPos = out.featureValue(for: Self.posOutKeys[i])?.multiArrayValue
+            else {
+                throw MagpieTTSError.generationFailed("Decoder missing output for layer \(i)")
+            }
+            caches["cache\(i)"] = newCache
+            positions["position\(i)"] = newPos
         }
-        return out.featureValue(for: "input")!.multiArrayValue!  // hidden state (1, 1, dModel)
+        guard let hidden = out.featureValue(for: "input")?.multiArrayValue else {
+            throw MagpieTTSError.generationFailed("Decoder missing hidden-state output")
+        }
+        return hidden  // (1, 1, dModel)
     }
 
     // MARK: - Private: Audio Embedding
 
     private func embedAudioCodes(_ codes: [Int32]) throws -> MLMultiArray {
-        let dM = config!.dModel
-        let nCb = config!.numCodebooks
+        guard let cfg = config, let embs = audioEmbeddings else {
+            throw MagpieTTSError.generationFailed("Config or audio embeddings not loaded")
+        }
+        let dM = cfg.dModel
+        let nCb = cfg.numCodebooks
         let vDM = vDSP_Length(dM)
         var emb = [Float](repeating: 0, count: dM)
         for cb in 0 ..< nCb {
             let off = Int(codes[cb]) * dM
-            audioEmbeddings![cb].withUnsafeBufferPointer { table in
+            embs[cb].withUnsafeBufferPointer { table in
                 vDSP_vadd(emb, 1, table.baseAddress! + off, 1, &emb, 1, vDM)
             }
         }

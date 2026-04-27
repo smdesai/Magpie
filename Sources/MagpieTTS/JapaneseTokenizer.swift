@@ -25,38 +25,46 @@ final class JapaneseTokenizer {
 
     // Mora splitting: matches katakana mora units
     // Pattern: full kana + optional small kana | standalone small kana | chōonpu
-    private static let moraRegex = try! NSRegularExpression(
-        pattern: "[ア-ンヴ][ャュョァィゥェォヮ]?|[ァィゥェォヵヶッャュョヮ]|ー"
-    )
+    private static let moraRegex = #/[ア-ンヴ][ャュョァィゥェォヮ]?|[ァィゥェォヵヶッャュョヮ]|ー/#
 
     // Part-of-speech tags for punctuation in OpenJTalk
     private static let punctPOS: Set<String> = ["記号", "補助記号"]
 
     init(constantsDirectory: URL) throws {
         // Load token2id
-        let t2iURL = constantsDirectory.appendingPathComponent("japanese_phoneme_token2id.json")
+        let t2iURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("japanese_phoneme_token2id.json")
         guard FileManager.default.fileExists(atPath: t2iURL.path) else {
             throw MagpieTTSError.constantsNotFound("japanese_phoneme_token2id.json")
         }
         let t2iData = try Data(contentsOf: t2iURL)
-        self.token2id = try JSONSerialization.jsonObject(with: t2iData) as! [String: Int]
+        guard let token2id = try JSONSerialization.jsonObject(with: t2iData) as? [String: Int]
+        else {
+            throw MagpieTTSError.invalidConfiguration("japanese_phoneme_token2id.json: malformed")
+        }
+        self.token2id = token2id
         self.tokens = Set(token2id.keys)
 
         // Load punctuation list
-        let punctURL = constantsDirectory.appendingPathComponent(
-            "japanese_phoneme_punctuation.json")
+        let punctURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("japanese_phoneme_punctuation.json")
         guard FileManager.default.fileExists(atPath: punctURL.path) else {
             throw MagpieTTSError.constantsNotFound("japanese_phoneme_punctuation.json")
         }
         let punctData = try Data(contentsOf: punctURL)
-        let punctList = try JSONSerialization.jsonObject(with: punctData) as! [String]
+        guard let punctList = try JSONSerialization.jsonObject(with: punctData) as? [String] else {
+            throw MagpieTTSError.invalidConfiguration(
+                "japanese_phoneme_punctuation.json: malformed")
+        }
         self.punctSet = Set(punctList)
 
         // Load pad_with_space from metadata
-        let metaURL = constantsDirectory.appendingPathComponent("tokenizer_metadata.json")
-        if FileManager.default.fileExists(atPath: metaURL.path) {
-            let metaData = try Data(contentsOf: metaURL)
-            let metaJson = try JSONSerialization.jsonObject(with: metaData) as! [String: Any]
+        let metaURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("tokenizer_metadata.json")
+        if FileManager.default.fileExists(atPath: metaURL.path),
+            let metaData = try? Data(contentsOf: metaURL),
+            let metaJson = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any]
+        {
             if let padDict = metaJson["pad_with_space"] as? [String: Bool] {
                 self.padWithSpace = padDict["japanese_phoneme"] ?? true
             } else {
@@ -180,12 +188,7 @@ final class JapaneseTokenizer {
 
     /// Split a katakana pronunciation string into individual mora.
     private func splitMora(_ pron: String) -> [String] {
-        let nsString = pron as NSString
-        let matches = Self.moraRegex.matches(
-            in: pron,
-            range: NSRange(location: 0, length: nsString.length)
-        )
-        return matches.map { nsString.substring(with: $0.range) }
+        pron.matches(of: Self.moraRegex).map { String($0.output) }
     }
 
     /// Calculate Japanese pitch accent pattern.

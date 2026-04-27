@@ -23,15 +23,15 @@ public final class EnglishTokenizer {
     private let tokens: Set<String>
     private let punctList: Set<Character>
 
-    // Regex: word | |unchanged| | non-word
+    // Word | |unchanged| | non-word
     // Matches NeMo's _WORDS_RE_EN = r"([A-Za-z]+(?:[A-Za-z\-']*[A-Za-z]+)*)|(\|[^|]*\|)|([^A-Za-z|]+)"
-    private static let wordRegex = try! NSRegularExpression(
-        pattern: #"([A-Za-z]+(?:[A-Za-z\-']*[A-Za-z]+)*)|(\|[^\|]*\|)|([^A-Za-z\|]+)"#
-    )
+    private static let wordRegex =
+        #/([A-Za-z]+(?:[A-Za-z\-']*[A-Za-z]+)*)|(\|[^\|]*\|)|([^A-Za-z\|]+)/#
 
     public init(constantsDirectory: URL, eosTokenId: Int = 2361) throws {
-        let dictURL = constantsDirectory.appendingPathComponent("english_phoneme_dict.json")
-        let t2iURL = constantsDirectory.appendingPathComponent("english_token2id.json")
+        let tokDir = constantsDirectory.appendingPathComponent("tokenizer")
+        let dictURL = tokDir.appendingPathComponent("english_phoneme_dict.json")
+        let t2iURL = tokDir.appendingPathComponent("english_token2id.json")
 
         guard FileManager.default.fileExists(atPath: dictURL.path) else {
             throw MagpieTTSError.constantsNotFound("english_phoneme_dict.json")
@@ -41,15 +41,26 @@ public final class EnglishTokenizer {
         }
 
         let dictData = try Data(contentsOf: dictURL)
-        let rawDict = try JSONSerialization.jsonObject(with: dictData) as! [String: [String]]
+        guard
+            let rawDict = try JSONSerialization.jsonObject(with: dictData)
+                as? [String: [String]]
+        else {
+            throw MagpieTTSError.invalidConfiguration("english_phoneme_dict.json: malformed")
+        }
         self.phonemeDict = rawDict
 
         let t2iData = try Data(contentsOf: t2iURL)
-        let rawT2i = try JSONSerialization.jsonObject(with: t2iData) as! [String: Int]
+        guard let rawT2i = try JSONSerialization.jsonObject(with: t2iData) as? [String: Int]
+        else {
+            throw MagpieTTSError.invalidConfiguration("english_token2id.json: malformed")
+        }
         self.token2id = rawT2i
 
         self.eosTokenId = eosTokenId
-        self.spaceId = rawT2i[" "]!
+        guard let spaceId = rawT2i[" "] else {
+            throw MagpieTTSError.invalidConfiguration("english_token2id.json: missing space token")
+        }
+        self.spaceId = spaceId
         self.tokens = Set(rawT2i.keys)
         self.punctList = Set("!\"(),-.:;?[]{}/")
     }
@@ -69,34 +80,20 @@ public final class EnglishTokenizer {
     /// Split text into (tokens, isUnchanged) pairs.
     /// Matches NeMo's `english_word_tokenize`.
     private func wordTokenize(_ text: String) -> [(tokens: [String], unchanged: Bool)] {
-        let nsText = text as NSString
-        let matches = Self.wordRegex.matches(
-            in: text, range: NSRange(location: 0, length: nsText.length))
-
         var result = [(tokens: [String], unchanged: Bool)]()
-        for match in matches {
-            let word = rangeStr(nsText, match, 1)
-            let unchanged = rangeStr(nsText, match, 2)
-            let punct = rangeStr(nsText, match, 3)
-
-            if let w = word {
+        for match in text.matches(of: Self.wordRegex) {
+            let (_, word, unchanged, punct) = match.output
+            if let w = word, !w.isEmpty {
                 result.append(([w.lowercased()], false))
-            } else if let u = unchanged {
+            } else if let u = unchanged, !u.isEmpty {
                 // Strip | delimiters, split by space
-                let inner = String(u.dropFirst().dropLast())
+                let inner = u.dropFirst().dropLast()
                 result.append((inner.split(separator: " ").map(String.init), true))
-            } else if let p = punct {
-                result.append(([p], false))
+            } else if let p = punct, !p.isEmpty {
+                result.append(([String(p)], false))
             }
         }
         return result
-    }
-
-    private func rangeStr(_ s: NSString, _ match: NSTextCheckingResult, _ group: Int) -> String? {
-        let r = match.range(at: group)
-        guard r.location != NSNotFound else { return nil }
-        let str = s.substring(with: r)
-        return str.isEmpty ? nil : str
     }
 
     // MARK: - Grapheme to Phoneme

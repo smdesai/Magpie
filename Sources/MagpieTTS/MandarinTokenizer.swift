@@ -23,12 +23,15 @@ final class JiebaSegmenter {
     private let prefixes: Set<String>
 
     init(constantsDirectory: URL) throws {
-        let url = constantsDirectory.appendingPathComponent("mandarin_jieba_dict.json")
+        let url = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("mandarin_jieba_dict.json")
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_jieba_dict.json")
         }
         let data = try Data(contentsOf: url)
-        let freqDict = try JSONSerialization.jsonObject(with: data) as! [String: Int]
+        guard let freqDict = try JSONSerialization.jsonObject(with: data) as? [String: Int] else {
+            throw MagpieTTSError.invalidConfiguration("mandarin_jieba_dict.json: malformed")
+        }
 
         let total = Double(freqDict.values.reduce(0, +))
         self.logTotal = log(total)
@@ -137,13 +140,20 @@ final class PinyinConverter {
     private let phraseDict: [String: [String]]
 
     init(constantsDirectory: URL) throws {
+        let tokDir = constantsDirectory.appendingPathComponent("tokenizer")
+
         // Load character → pinyin dict
-        let charURL = constantsDirectory.appendingPathComponent("mandarin_pypinyin_char_dict.json")
+        let charURL = tokDir.appendingPathComponent("mandarin_pypinyin_char_dict.json")
         guard FileManager.default.fileExists(atPath: charURL.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_pypinyin_char_dict.json")
         }
         let charData = try Data(contentsOf: charURL)
-        let charJson = try JSONSerialization.jsonObject(with: charData) as! [String: [String]]
+        guard
+            let charJson = try JSONSerialization.jsonObject(with: charData)
+                as? [String: [String]]
+        else {
+            throw MagpieTTSError.invalidConfiguration("mandarin_pypinyin_char_dict.json: malformed")
+        }
         var cd = [Character: [String]]()
         cd.reserveCapacity(charJson.count)
         for (key, value) in charJson {
@@ -154,13 +164,19 @@ final class PinyinConverter {
         self.charDict = cd
 
         // Load phrase → pinyin dict
-        let phraseURL = constantsDirectory.appendingPathComponent(
-            "mandarin_pypinyin_phrase_dict.json")
+        let phraseURL = tokDir.appendingPathComponent("mandarin_pypinyin_phrase_dict.json")
         guard FileManager.default.fileExists(atPath: phraseURL.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_pypinyin_phrase_dict.json")
         }
         let phraseData = try Data(contentsOf: phraseURL)
-        self.phraseDict = try JSONSerialization.jsonObject(with: phraseData) as! [String: [String]]
+        guard
+            let phraseDict = try JSONSerialization.jsonObject(with: phraseData)
+                as? [String: [String]]
+        else {
+            throw MagpieTTSError.invalidConfiguration(
+                "mandarin_pypinyin_phrase_dict.json: malformed")
+        }
+        self.phraseDict = phraseDict
     }
 
     /// Convert a word (from jieba segmentation) to pinyin sequence.
@@ -208,20 +224,32 @@ final class MandarinTokenizer {
         self.pinyin = try PinyinConverter(constantsDirectory: constantsDirectory)
 
         // Load pinyin → phoneme dict (413 entries)
-        let pdURL = constantsDirectory.appendingPathComponent("mandarin_phoneme_pinyin_dict.json")
+        let pdURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("mandarin_phoneme_pinyin_dict.json")
         guard FileManager.default.fileExists(atPath: pdURL.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_phoneme_pinyin_dict.json")
         }
         let pdData = try Data(contentsOf: pdURL)
-        self.phonemeDict = try JSONSerialization.jsonObject(with: pdData) as! [String: [String]]
+        guard
+            let phonemeDict = try JSONSerialization.jsonObject(with: pdData)
+                as? [String: [String]]
+        else {
+            throw MagpieTTSError.invalidConfiguration(
+                "mandarin_phoneme_pinyin_dict.json: malformed")
+        }
+        self.phonemeDict = phonemeDict
 
         // Load tone dict (5 entries: "1"→"#1", etc.)
-        let toneURL = constantsDirectory.appendingPathComponent("mandarin_phoneme_tone_dict.json")
+        let toneURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("mandarin_phoneme_tone_dict.json")
         guard FileManager.default.fileExists(atPath: toneURL.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_phoneme_tone_dict.json")
         }
         let toneData = try Data(contentsOf: toneURL)
-        let toneJson = try JSONSerialization.jsonObject(with: toneData) as! [String: String]
+        guard let toneJson = try JSONSerialization.jsonObject(with: toneData) as? [String: String]
+        else {
+            throw MagpieTTSError.invalidConfiguration("mandarin_phoneme_tone_dict.json: malformed")
+        }
         var td = [Character: String]()
         for (k, v) in toneJson {
             if let ch = k.first { td[ch] = v }
@@ -229,13 +257,17 @@ final class MandarinTokenizer {
         self.toneDict = td
 
         // Load ASCII letter dict (26 entries: "A"→"A", etc.)
-        let asciiURL = constantsDirectory.appendingPathComponent(
-            "mandarin_phoneme_ascii_letter_dict.json")
+        let asciiURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("mandarin_phoneme_ascii_letter_dict.json")
         guard FileManager.default.fileExists(atPath: asciiURL.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_phoneme_ascii_letter_dict.json")
         }
         let asciiData = try Data(contentsOf: asciiURL)
-        let asciiJson = try JSONSerialization.jsonObject(with: asciiData) as! [String: String]
+        guard let asciiJson = try JSONSerialization.jsonObject(with: asciiData) as? [String: String]
+        else {
+            throw MagpieTTSError.invalidConfiguration(
+                "mandarin_phoneme_ascii_letter_dict.json: malformed")
+        }
         var ad = [Character: String]()
         for (k, v) in asciiJson {
             if let ch = k.first { ad[ch] = v }
@@ -243,19 +275,26 @@ final class MandarinTokenizer {
         self.asciiLetterDict = ad
 
         // Load token2id
-        let t2iURL = constantsDirectory.appendingPathComponent("mandarin_phoneme_token2id.json")
+        let t2iURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("mandarin_phoneme_token2id.json")
         guard FileManager.default.fileExists(atPath: t2iURL.path) else {
             throw MagpieTTSError.constantsNotFound("mandarin_phoneme_token2id.json")
         }
         let t2iData = try Data(contentsOf: t2iURL)
-        self.token2id = try JSONSerialization.jsonObject(with: t2iData) as! [String: Int]
+        guard let token2id = try JSONSerialization.jsonObject(with: t2iData) as? [String: Int]
+        else {
+            throw MagpieTTSError.invalidConfiguration("mandarin_phoneme_token2id.json: malformed")
+        }
+        self.token2id = token2id
         self.tokens = Set(token2id.keys)
 
         // Load pad_with_space from metadata
-        let metaURL = constantsDirectory.appendingPathComponent("tokenizer_metadata.json")
-        if FileManager.default.fileExists(atPath: metaURL.path) {
-            let metaData = try Data(contentsOf: metaURL)
-            let metaJson = try JSONSerialization.jsonObject(with: metaData) as! [String: Any]
+        let metaURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("tokenizer_metadata.json")
+        if FileManager.default.fileExists(atPath: metaURL.path),
+            let metaData = try? Data(contentsOf: metaURL),
+            let metaJson = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any]
+        {
             if let padDict = metaJson["pad_with_space"] as? [String: Bool] {
                 self.padWithSpace = padDict["mandarin_phoneme"] ?? true
             } else {

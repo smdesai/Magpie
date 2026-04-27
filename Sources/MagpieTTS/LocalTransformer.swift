@@ -75,15 +75,26 @@ private func matmulT(
     alpha: Float = 1, into c: inout [Float]
 ) {
     a.withUnsafeBufferPointer { ap in
-        b.withUnsafeBufferPointer { bp in
-            c.withUnsafeMutableBufferPointer { cp in
-                cblas_sgemm(
-                    CblasRowMajor, CblasNoTrans, CblasTrans,
-                    Int32(M), Int32(N), Int32(K),
-                    alpha, ap.baseAddress!, Int32(K),
-                    bp.baseAddress!, Int32(K),
-                    0, cp.baseAddress!, Int32(N))
-            }
+        matmulT(ap.baseAddress!, b, M: M, N: N, K: K, alpha: alpha, into: &c)
+    }
+}
+
+/// Pointer-input variant of matmulT: same as above but `a` is a raw pointer
+/// (caller pinky-promises the buffer holds at least M*K floats). Used to avoid
+/// allocating an Array when the source is a slice of an existing buffer
+/// (e.g. an audio-embedding row).
+private func matmulT(
+    _ a: UnsafePointer<Float>, _ b: [Float], M: Int, N: Int, K: Int,
+    alpha: Float = 1, into c: inout [Float]
+) {
+    b.withUnsafeBufferPointer { bp in
+        c.withUnsafeMutableBufferPointer { cp in
+            cblas_sgemm(
+                CblasRowMajor, CblasNoTrans, CblasTrans,
+                Int32(M), Int32(N), Int32(K),
+                alpha, a, Int32(K),
+                bp.baseAddress!, Int32(K),
+                0, cp.baseAddress!, Int32(N))
         }
     }
 }
@@ -137,40 +148,40 @@ private func layerNorm(_ x: [Float], weight: [Float], T: Int, D: Int, eps: Float
     return out
 }
 
-private func gelu(_ x: [Float]) -> [Float] {
+/// In-place GELU using a caller-supplied scratch buffer (same size as `x`).
+/// Avoids the per-call allocation of the previous `gelu(_:) -> [Float]` form.
+private func geluInPlace(_ x: inout [Float], scratch: inout [Float]) {
     let n = x.count
-    var result = [Float](repeating: 0, count: n)
+    let vN = vDSP_Length(n)
+    var k = Float(0.044715)
+    var c = Float(0.7978845608028654)
+    var one: Float = 1.0
+    var half: Float = 0.5
+
+    // Phase 1: scratch = 1 + tanh(c * x * (1 + k*x²))
     x.withUnsafeBufferPointer { xBuf in
-        result.withUnsafeMutableBufferPointer { rBuf in
+        scratch.withUnsafeMutableBufferPointer { sBuf in
             let xp = xBuf.baseAddress!
-            let rp = rBuf.baseAddress!
-            let vN = vDSP_Length(n)
-            var k = Float(0.044715)
-            var c = Float(0.7978845608028654)
-            var one: Float = 1.0
-            var half: Float = 0.5
-            // r = x^2
-            vDSP_vsq(xp, 1, rp, 1, vN)
-            // r = k * x^2
-            vDSP_vsmul(rp, 1, &k, rp, 1, vN)
-            // r = 1 + k * x^2
-            vDSP_vsadd(rp, 1, &one, rp, 1, vN)
-            // r = x * (1 + k * x^2)
-            vDSP_vmul(xp, 1, rp, 1, rp, 1, vN)
-            // r = c * x * (1 + k * x^2)
-            vDSP_vsmul(rp, 1, &c, rp, 1, vN)
-            // r = tanh(r)
+            let sp = sBuf.baseAddress!
+            vDSP_vsq(xp, 1, sp, 1, vN)  // s = x²
+            vDSP_vsmul(sp, 1, &k, sp, 1, vN)  // s = k·x²
+            vDSP_vsadd(sp, 1, &one, sp, 1, vN)  // s = 1 + k·x²
+            vDSP_vmul(xp, 1, sp, 1, sp, 1, vN)  // s = x·(1 + k·x²)
+            vDSP_vsmul(sp, 1, &c, sp, 1, vN)  // s = c·x·(1 + k·x²)
             var nn = Int32(n)
-            vvtanhf(rp, rp, &nn)
-            // r = 1 + tanh(...)
-            vDSP_vsadd(rp, 1, &one, rp, 1, vN)
-            // r = x * (1 + tanh(...))
-            vDSP_vmul(xp, 1, rp, 1, rp, 1, vN)
-            // r = 0.5 * r
-            vDSP_vsmul(rp, 1, &half, rp, 1, vN)
+            vvtanhf(sp, sp, &nn)  // s = tanh(...)
+            vDSP_vsadd(sp, 1, &one, sp, 1, vN)  // s = 1 + tanh(...)
         }
     }
-    return result
+    // Phase 2: x = 0.5 * x * scratch  (separate so x can be the mutable buffer)
+    x.withUnsafeMutableBufferPointer { xBuf in
+        scratch.withUnsafeBufferPointer { sBuf in
+            let xp = xBuf.baseAddress!
+            let sp = sBuf.baseAddress!
+            vDSP_vmul(xp, 1, sp, 1, xp, 1, vN)  // x = x · (1 + tanh(...))
+            vDSP_vsmul(xp, 1, &half, xp, 1, vN)  // x = 0.5 · x · (1 + tanh(...))
+        }
+    }
 }
 
 // MARK: - Local Transformer Forward
@@ -249,8 +260,9 @@ func localTransformerForward(_ seq: [Float], T: Int, _ w: LocalTransformerWeight
 
     // FFN up: (T,256) @ (1024,256)^T → (T,1024)
     var h = [Float](repeating: 0, count: T * F)
+    var hScratch = [Float](repeating: 0, count: T * F)
     matmulT(xn2, w.ffnW1, M: T, N: F, K: D, into: &h)
-    h = gelu(h)
+    geluInPlace(&h, scratch: &hScratch)
 
     // FFN down: (T,1024) @ (256,1024)^T → (T,256)
     var ffnOut = [Float](repeating: 0, count: T * D)
@@ -292,11 +304,15 @@ struct LocalTransformerCache {
 
 /// Single-token forward step with KV cache. Returns output for the new token (D elements).
 /// Avoids recomputing Q/K/V for all previous positions.
+///
+/// `ffnScratch` is a caller-supplied buffer of size `LocalTransformerWeights.ffnDim`,
+/// reused by the in-place GELU to avoid per-call allocation.
 func localTransformerStepCached(
     _ input: [Float],
     position: Int,
     cache: inout LocalTransformerCache,
-    _ w: LocalTransformerWeights
+    _ w: LocalTransformerWeights,
+    ffnScratch: inout [Float]
 ) -> [Float] {
     let D = LocalTransformerWeights.dim
     let F = LocalTransformerWeights.ffnDim
@@ -381,7 +397,7 @@ func localTransformerStepCached(
 
     var h = [Float](repeating: 0, count: F)
     matmulT(xn2, w.ffnW1, M: 1, N: F, K: D, into: &h)
-    h = gelu(h)
+    geluInPlace(&h, scratch: &ffnScratch)
 
     var ffnOut = [Float](repeating: 0, count: D)
     matmulT(h, w.ffnW2, M: 1, N: D, K: F, into: &ffnOut)
@@ -393,17 +409,25 @@ func localTransformerStepCached(
 // MARK: - Top-K Sampling
 
 func sampleTopK(
-    logits: inout [Float], temperature: Float, topK: Int,
+    logits: inout [Float], scratch: inout [Float],
+    temperature: Float, topK: Int,
     rng: inout SplitMix64
 ) -> Int {
     let n = logits.count
     let vN = vDSP_Length(n)
 
-    // Top-k filter
+    // Top-k filter — sort a memcpy'd scratch instead of allocating `var sorted = logits`.
+    // For n=2024, the previous form allocated 8 KB per call * 8 codebooks * 500 steps ≈ 32 MB
+    // of churn per generation; the scratch is preallocated once by the caller.
     if topK > 0, topK < n {
-        var sorted = logits
-        vDSP_vsort(&sorted, vN, 1)  // ascending
-        let threshold = sorted[n - topK]
+        precondition(scratch.count >= n, "sampleTopK scratch too small")
+        scratch.withUnsafeMutableBufferPointer { dst in
+            logits.withUnsafeBufferPointer { src in
+                memcpy(dst.baseAddress!, src.baseAddress!, n * MemoryLayout<Float>.stride)
+            }
+        }
+        vDSP_vsort(&scratch, vN, 1)  // ascending
+        let threshold = scratch[n - topK]
         let negInf = -Float.infinity
         logits.withUnsafeMutableBufferPointer { buf in
             let p = buf.baseAddress!
@@ -462,16 +486,23 @@ func localTransformerSample(
     let forbidden = forbidEOS ? forbiddenForbidEOS : forbiddenAllowEOS
     let useCFG = uncondDecoderHidden != nil && cfgScale != 1.0
     let ltD = LocalTransformerWeights.dim  // 256
+    let F = LocalTransformerWeights.ffnDim  // 1024
     let dModel = 768
     let vocab = 2024
     let vVocab = vDSP_Length(vocab)
 
-    // Project decoder hidden (768) → LT dim (256)
-    func project(_ hidden: [Float]) -> [Float] {
-        var out = [Float](repeating: 0, count: ltD)
-        matmulT(hidden, weights.inProjWeight, M: 1, N: ltD, K: dModel, into: &out)
-        vDSP_vadd(out, 1, weights.inProjBias, 1, &out, 1, vDSP_Length(ltD))
-        return out
+    // Reusable scratch buffers — allocated once, reused across all codebook iterations
+    // and step calls. Eliminates ~3000 small Array allocations per generation.
+    var projInput = [Float](repeating: 0, count: ltD)  // 256: project() output
+    var ffnScratch = [Float](repeating: 0, count: F)  // 1024: GELU scratch in step
+    var condLogits = [Float](repeating: 0, count: vocab)  // 2024: per-codebook logits
+    var uncondLogits = [Float](repeating: 0, count: vocab)  // 2024
+    var topKScratch = [Float](repeating: 0, count: vocab)  // 2024: top-k threshold sort
+
+    /// Project a 768-dim hidden state (passed via pointer) → 256-dim into `projInput`.
+    func project(_ hidden: UnsafePointer<Float>) {
+        matmulT(hidden, weights.inProjWeight, M: 1, N: ltD, K: dModel, into: &projInput)
+        vDSP_vadd(projInput, 1, weights.inProjBias, 1, &projInput, 1, vDSP_Length(ltD))
     }
 
     // Initialize KV caches (max entries = numCodebooks + 1 for initial token)
@@ -480,60 +511,60 @@ func localTransformerSample(
     var uncondCache = LocalTransformerCache(maxT: maxT)
 
     // Process initial token through cached step
+    decoderHidden.withUnsafeBufferPointer { hp in project(hp.baseAddress!) }
     var condLast = localTransformerStepCached(
-        project(decoderHidden), position: 0, cache: &condCache, weights)
+        projInput, position: 0, cache: &condCache, weights, ffnScratch: &ffnScratch)
     var uncondLast = [Float]()
     if useCFG {
+        uncondDecoderHidden!.withUnsafeBufferPointer { hp in project(hp.baseAddress!) }
         uncondLast = localTransformerStepCached(
-            project(uncondDecoderHidden!), position: 0, cache: &uncondCache, weights)
+            projInput, position: 0, cache: &uncondCache, weights, ffnScratch: &ffnScratch)
     }
 
     var codes = [Int32](repeating: 0, count: numCodebooks)
 
     for cb in 0 ..< numCodebooks {
         // Logits from last output: (1, 256) @ (2024, 256)^T + bias
-        var condLogits = [Float](repeating: 0, count: vocab)
         matmulT(condLast, weights.outProjWeights[cb], M: 1, N: vocab, K: ltD, into: &condLogits)
         vDSP_vadd(condLogits, 1, weights.outProjBiases[cb], 1, &condLogits, 1, vVocab)
 
-        var finalLogits: [Float]
         if useCFG {
-            var uncondLogits = [Float](repeating: 0, count: vocab)
             matmulT(
                 uncondLast, weights.outProjWeights[cb], M: 1, N: vocab, K: ltD,
                 into: &uncondLogits)
             vDSP_vadd(uncondLogits, 1, weights.outProjBiases[cb], 1, &uncondLogits, 1, vVocab)
 
-            // CFG: scale * cond + (1 - scale) * uncond
-            finalLogits = [Float](repeating: 0, count: vocab)
-            var ics = 1.0 - cfgScale
-            vDSP_vsmul(uncondLogits, 1, &ics, &finalLogits, 1, vVocab)
+            // CFG combine in-place into condLogits: condLogits = cfgScale*cond + (1-cfgScale)*uncond
             var cs = cfgScale
-            vDSP_vsma(condLogits, 1, &cs, finalLogits, 1, &finalLogits, 1, vVocab)
-        } else {
-            finalLogits = condLogits
+            vDSP_vsmul(condLogits, 1, &cs, &condLogits, 1, vVocab)
+            var ics = 1.0 - cfgScale
+            vDSP_vsma(uncondLogits, 1, &ics, condLogits, 1, &condLogits, 1, vVocab)
         }
 
         // Mask forbidden tokens
-        for tok in forbidden where tok < vocab { finalLogits[tok] = -.infinity }
+        for tok in forbidden where tok < vocab { condLogits[tok] = -.infinity }
 
         // Sample
         codes[cb] = Int32(
             sampleTopK(
-                logits: &finalLogits, temperature: temperature,
-                topK: topK, rng: &rng))
+                logits: &condLogits, scratch: &topKScratch,
+                temperature: temperature, topK: topK, rng: &rng))
 
         // Embed sampled token → project → cached step for next codebook
         if cb < numCodebooks - 1 {
             let idx = Int(codes[cb])
-            let emb = Array(audioEmbeddings[cb][idx * dModel ..< (idx + 1) * dModel])
-            let nextInput = project(emb)
+            let off = idx * dModel
+            audioEmbeddings[cb].withUnsafeBufferPointer { embPtr in
+                project(embPtr.baseAddress! + off)
+            }
             let nextPos = cb + 1
             condLast = localTransformerStepCached(
-                nextInput, position: nextPos, cache: &condCache, weights)
+                projInput, position: nextPos, cache: &condCache, weights,
+                ffnScratch: &ffnScratch)
             if useCFG {
                 uncondLast = localTransformerStepCached(
-                    nextInput, position: nextPos, cache: &uncondCache, weights)
+                    projInput, position: nextPos, cache: &uncondCache, weights,
+                    ffnScratch: &ffnScratch)
             }
         }
     }

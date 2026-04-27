@@ -1,10 +1,3 @@
-//
-//  TTSActivityAttributes.swift
-//  MagpieTTS
-//
-//  Created by Sachin Desai on 4/21/26.
-//
-
 import ActivityKit
 import Foundation
 

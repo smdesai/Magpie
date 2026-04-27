@@ -19,11 +19,6 @@ public enum Language: String, CaseIterable, Sendable {
     case italian = "italian_phoneme"
     case vietnamese = "vietnamese_phoneme"
 
-    /// All languages support text-to-tokens natively in Swift.
-    public var supportsTextInput: Bool {
-        return true
-    }
-
     /// Human-readable name for UI display.
     public var displayName: String {
         switch self {
@@ -48,14 +43,20 @@ struct TokenizerMetadata {
     let eosTokenId: Int
 
     init(constantsDirectory: URL) throws {
-        let url = constantsDirectory.appendingPathComponent("tokenizer_metadata.json")
+        let url = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("tokenizer_metadata.json")
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw MagpieTTSError.constantsNotFound("tokenizer_metadata.json")
         }
         let data = try Data(contentsOf: url)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-        self.offsets = json["offsets"] as! [String: Int]
-        self.eosTokenId = json["eos_token_id"] as! Int
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let offsets = json["offsets"] as? [String: Int],
+            let eosTokenId = json["eos_token_id"] as? Int
+        else {
+            throw MagpieTTSError.invalidConfiguration("tokenizer_metadata.json: malformed shape")
+        }
+        self.offsets = offsets
+        self.eosTokenId = eosTokenId
     }
 }
 
@@ -76,13 +77,10 @@ public final class MultiLanguageTokenizer {
 
     /// Tokenize text for the given language. Returns global token IDs including model EOS.
     public func tokenize(_ text: String, language: Language) throws -> [Int32] {
-        guard language.supportsTextInput else {
+        guard let offset = metadata.offsets[language.rawValue] else {
             throw MagpieTTSError.invalidConfiguration(
-                "\(language) requires pre-tokenized input. Use generate(tokenIDs:) with Python-generated tokens."
-            )
+                "No offset for language \(language.rawValue) in tokenizer_metadata")
         }
-
-        let offset = metadata.offsets[language.rawValue]!
         let eos = metadata.eosTokenId
 
         switch language {
@@ -192,37 +190,53 @@ final class IPALanguageTokenizer {
 
     enum GraphemeCase { case upper, mixed }
 
-    // Regex for Latin + accented characters (any_locale_word_tokenize)
-    private static let anyLocaleWordRegex = try! NSRegularExpression(
-        pattern:
-            #"([A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF]+(?:[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\-']*[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF]+)*)|(\|[^\|]*\|)|([^A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\|]+)"#
-    )
+    // Regex for Latin + accented characters (any_locale_word_tokenize).
+    // Three alternation branches (in order):
+    //   1. word: letters/accented, with optional internal `-`/`'`
+    //   2. |unchanged| span — kept verbatim through tokenization
+    //   3. non-word run (whitespace and punctuation)
+    private static let anyLocaleWordRegex =
+        #/([A-Za-z\u{00C0}-\u{00D6}\u{00D8}-\u{00F6}\u{00F8}-\u{00FF}]+(?:[A-Za-z\u{00C0}-\u{00D6}\u{00D8}-\u{00F6}\u{00F8}-\u{00FF}\-']*[A-Za-z\u{00C0}-\u{00D6}\u{00D8}-\u{00F6}\u{00F8}-\u{00FF}]+)*)|(\|[^\|]*\|)|([^A-Za-z\u{00C0}-\u{00D6}\u{00D8}-\u{00F6}\u{00F8}-\u{00FF}\|]+)/#
 
     init(language: Language, constantsDirectory: URL) throws {
         let name = language.rawValue
 
+        let tokDir = constantsDirectory.appendingPathComponent("tokenizer")
+
         // Load phoneme dict
-        let dictURL = constantsDirectory.appendingPathComponent("\(name)_phoneme_dict.json")
+        let dictURL = tokDir.appendingPathComponent("\(name)_phoneme_dict.json")
         guard FileManager.default.fileExists(atPath: dictURL.path) else {
             throw MagpieTTSError.constantsNotFound("\(name)_phoneme_dict.json")
         }
         let dictData = try Data(contentsOf: dictURL)
-        self.phonemeDict = try JSONSerialization.jsonObject(with: dictData) as! [String: [String]]
+        guard
+            let phonemeDict = try JSONSerialization.jsonObject(with: dictData)
+                as? [String: [String]]
+        else {
+            throw MagpieTTSError.invalidConfiguration("\(name)_phoneme_dict.json: malformed")
+        }
+        self.phonemeDict = phonemeDict
 
         // Load token2id
-        let t2iURL = constantsDirectory.appendingPathComponent("\(name)_token2id.json")
+        let t2iURL = tokDir.appendingPathComponent("\(name)_token2id.json")
         guard FileManager.default.fileExists(atPath: t2iURL.path) else {
             throw MagpieTTSError.constantsNotFound("\(name)_token2id.json")
         }
         let t2iData = try Data(contentsOf: t2iURL)
-        self.token2id = try JSONSerialization.jsonObject(with: t2iData) as! [String: Int]
+        guard let token2id = try JSONSerialization.jsonObject(with: t2iData) as? [String: Int]
+        else {
+            throw MagpieTTSError.invalidConfiguration("\(name)_token2id.json: malformed")
+        }
+        self.token2id = token2id
         self.tokens = Set(token2id.keys)
 
         // Load heteronyms (optional)
-        let hetURL = constantsDirectory.appendingPathComponent("\(name)_heteronyms.json")
+        let hetURL = tokDir.appendingPathComponent("\(name)_heteronyms.json")
         if FileManager.default.fileExists(atPath: hetURL.path) {
             let hetData = try Data(contentsOf: hetURL)
-            let hetList = try JSONSerialization.jsonObject(with: hetData) as! [String]
+            guard let hetList = try JSONSerialization.jsonObject(with: hetData) as? [String] else {
+                throw MagpieTTSError.invalidConfiguration("\(name)_heteronyms.json: malformed")
+            }
             self.heteronyms = Set(hetList)
         } else {
             self.heteronyms = Set()
@@ -245,10 +259,11 @@ final class IPALanguageTokenizer {
         }
 
         // Load punct list from metadata
-        let metaURL = constantsDirectory.appendingPathComponent("tokenizer_metadata.json")
-        if FileManager.default.fileExists(atPath: metaURL.path) {
-            let metaData = try Data(contentsOf: metaURL)
-            let metaJson = try JSONSerialization.jsonObject(with: metaData) as! [String: Any]
+        let metaURL = tokDir.appendingPathComponent("tokenizer_metadata.json")
+        if FileManager.default.fileExists(atPath: metaURL.path),
+            let metaData = try? Data(contentsOf: metaURL),
+            let metaJson = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any]
+        {
             if let punctLists = metaJson["punct_lists"] as? [String: [String]],
                 let punct = punctLists[name]
             {
@@ -277,34 +292,20 @@ final class IPALanguageTokenizer {
     }
 
     private func wordTokenize(_ text: String) -> [(tokens: [String], unchanged: Bool)] {
-        let nsText = text as NSString
-        let regex = Self.anyLocaleWordRegex
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
-
         var result = [(tokens: [String], unchanged: Bool)]()
-        for match in matches {
-            let word = rangeStr(nsText, match, 1)
-            let unchanged = rangeStr(nsText, match, 2)
-            let punct = rangeStr(nsText, match, 3)
-
-            if let w = word {
+        for match in text.matches(of: Self.anyLocaleWordRegex) {
+            let (_, word, unchanged, punct) = match.output
+            if let w = word, !w.isEmpty {
                 // any_locale: no lowercasing (unlike English)
-                result.append(([w], false))
-            } else if let u = unchanged {
-                let inner = String(u.dropFirst().dropLast())
+                result.append(([String(w)], false))
+            } else if let u = unchanged, !u.isEmpty {
+                let inner = u.dropFirst().dropLast()
                 result.append((inner.split(separator: " ").map(String.init), true))
-            } else if let p = punct {
-                result.append(([p], false))
+            } else if let p = punct, !p.isEmpty {
+                result.append(([String(p)], false))
             }
         }
         return result
-    }
-
-    private func rangeStr(_ s: NSString, _ match: NSTextCheckingResult, _ group: Int) -> String? {
-        let r = match.range(at: group)
-        guard r.location != NSNotFound else { return nil }
-        let str = s.substring(with: r)
-        return str.isEmpty ? nil : str
     }
 
     private func g2p(_ words: [(tokens: [String], unchanged: Bool)]) -> [String] {
@@ -440,12 +441,18 @@ final class HindiCharTokenizer {
     private let punctList: Set<String>
 
     init(constantsDirectory: URL) throws {
-        let t2iURL = constantsDirectory.appendingPathComponent("hindi_chartokenizer_token2id.json")
+        let t2iURL = constantsDirectory.appendingPathComponent("tokenizer")
+            .appendingPathComponent("hindi_chartokenizer_token2id.json")
         guard FileManager.default.fileExists(atPath: t2iURL.path) else {
             throw MagpieTTSError.constantsNotFound("hindi_chartokenizer_token2id.json")
         }
         let t2iData = try Data(contentsOf: t2iURL)
-        self.token2id = try JSONSerialization.jsonObject(with: t2iData) as! [String: Int]
+        guard let token2id = try JSONSerialization.jsonObject(with: t2iData) as? [String: Int]
+        else {
+            throw MagpieTTSError.invalidConfiguration(
+                "hindi_chartokenizer_token2id.json: malformed")
+        }
+        self.token2id = token2id
         self.tokens = Set(token2id.keys)
         self.punctList = Set(#"!"(),-.:;?[]{}/""#.map(String.init))
     }

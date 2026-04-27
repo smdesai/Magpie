@@ -41,7 +41,7 @@ Magpie/
 
 > https://github.com/FluidInference/text-processing-rs
 
-Follow that repo's build instructions to produce `NemoTextProcessing.xcframework`, then place it at the root of this project so the final layout is:
+Follow that repo's build instructions to produce, then place it at the root of this project so the final layout is:
 
 ```
 Magpie/
@@ -52,9 +52,13 @@ Magpie/
     └── macos-arm64_x86_64/
 ```
 
+### 2. NemoTextProcessing.swift
+
+Copy `NemoTextProcessing.swift` from the same directory containing `NemoTextProcessing.xcframework` to Sources/MagpieTTS
+
 The Xcode project links this framework by path (see `project.yml`), so it must live in the current directory alongside `project.yml`.
 
-### 2. CoreML Models, Constants, and OpenJTalk.xcframework
+### 3. CoreML Models, Constants, and OpenJTalk.xcframework
 
 The `models/` directory, the `constants/` directory, and `OpenJTalk.xcframework` can all be obtained by following the build instructions at:
 
@@ -68,12 +72,13 @@ Magpie/
 │   ├── TextEncoder.mlmodelc/
 │   ├── DecoderPrefill.mlmodelc/
 │   ├── DecoderStep.mlmodelc/
-│   └── NanocodecDecoder.mlmodelc/
+│   └ NanocodecDecoder.mlmodelc/
 ├── constants/
-│   ├── *.json                  # tokenizers, phoneme dicts, speaker info
 │   ├── *.npy                   # speaker & audio embeddings
+│   ├── open_jtalk_dic/         # OpenJTalk dictionary
 │   ├── local_transformer/      # MLX weights
-│   └── open_jtalk_dic/         # OpenJTalk dictionary
+│   └── tokenizer/                     
+│       └── *.json/             # phoneme dicts
 └── OpenJTalk.xcframework/
     ├── Info.plist
     ├── ios-arm64/

@@ -43,7 +43,7 @@ final class TTSViewModel: ObservableObject {
     // MARK: - Data
 
     let voices: [Voice]
-    let languages: [Language] = Language.allCases.filter(\.supportsTextInput)
+    let languages: [Language] = Language.allCases
 
     // MARK: - Private
 
