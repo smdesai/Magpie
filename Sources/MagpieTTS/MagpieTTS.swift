@@ -203,13 +203,9 @@ public final class MagpieTTS {
     /// Once a loader has run, the loaded properties become write-once.
     private let loadLock = OSAllocatedUnfairLock<Void>(initialState: ())
 
-    // Decoder step I/O key mappings (from traced CoreML model variable names)
-    private static let cacheOutKeys: [String] = {
-        var keys = (0 ..< 11).map { "new_cache_\($0 * 2 + 1)" }
-        keys.append("new_cache")  // layer 11
-        return keys
-    }()
-    private static let posOutKeys: [String] = (0 ..< 12).map { "var_\(169 + $0 * 177)" }
+    // Decoder step I/O key mappings set by convert/convert_decoder_step.py.
+    private static let cacheOutKeys: [String] = (0 ..< 12).map { "new_cache\($0)" }
+    private static let posOutKeys: [String] = (0 ..< 12).map { "new_position\($0)" }
 
     /// Initialize with a model directory containing `build/` and `constants/` subdirectories.
     public init(modelDirectory: URL, computeUnits: MLComputeUnits = .cpuAndGPU) {
@@ -734,7 +730,7 @@ public final class MagpieTTS {
         pattern: #"(?<=[.!?])\s+(?=[A-Z])|(?<=[。！？])"#)
 
     /// Split text into individual sentences for chunked generation.
-    /// Each sentence is generated independently to avoid the model hitting EOS
+    /// Each sentence is generated independently  to avoid the model hitting EOS
     /// before vocalizing all text in a chunk.
     /// Sentences that exceed the model's text token limit (256) are split further
     /// on clause boundaries (commas) or word boundaries.
@@ -1242,9 +1238,6 @@ public final class MagpieTTS {
 
     // MARK: - Private: Prefill Cache Parsing
 
-    /// Output key names from decoder_prefill model (discovered on first use)
-    private var prefillOutputKeys: [String]?
-
     /// Parse prefill model outputs into the cache/position format used by decoder_step.
     private func parsePrefillCaches(
         _ result: MLFeatureProvider,
@@ -1253,34 +1246,11 @@ public final class MagpieTTS {
         tCtx: Int,
         nLayers: Int
     ) throws {
-        // Discover output key names on first call.
-        // CoreML names are like var_214, var_383, ... — must sort by numeric suffix
-        // to preserve layer order (alphabetical sort would put var_1059 before var_214).
-        if prefillOutputKeys == nil {
-            var keys = [String]()
-            for name in result.featureNames {
-                if let val = result.featureValue(for: name)?.multiArrayValue,
-                    val.shape.count == 5
-                {  // (2, B, max_seq, H, D)
-                    keys.append(name)
-                }
-            }
-            keys.sort { a, b in
-                let numA = Int(a.split(separator: "_").last ?? "") ?? 0
-                let numB = Int(b.split(separator: "_").last ?? "") ?? 0
-                return numA < numB
-            }
-            prefillOutputKeys = keys
-        }
-
-        let keys = prefillOutputKeys!
-        guard keys.count == nLayers else {
-            throw MagpieTTSError.generationFailed(
-                "Prefill model returned \(keys.count) caches, expected \(nLayers)")
-        }
-
         for i in 0 ..< nLayers {
-            caches["cache\(i)"] = result.featureValue(for: keys[i])!.multiArrayValue!
+            guard let cache = result.featureValue(for: "prefill_cache\(i)")?.multiArrayValue else {
+                throw MagpieTTSError.generationFailed("Prefill model missing cache for layer \(i)")
+            }
+            caches["cache\(i)"] = cache
             positions["position\(i)"] = try floatArray([Float(tCtx)], shape: [1])
         }
     }
@@ -1317,7 +1287,7 @@ public final class MagpieTTS {
             caches["cache\(i)"] = newCache
             positions["position\(i)"] = newPos
         }
-        guard let hidden = out.featureValue(for: "input")?.multiArrayValue else {
+        guard let hidden = out.featureValue(for: "decoder_hidden")?.multiArrayValue else {
             throw MagpieTTSError.generationFailed("Decoder missing hidden-state output")
         }
         return hidden  // (1, 1, dModel)
