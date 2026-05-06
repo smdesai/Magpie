@@ -32,22 +32,9 @@ targets:
       - path: MagpieTTSApp
       - path: Sources/MagpieTTS
       - path: Shared
-      # Resources as folder references
-      - path: constants
-        buildPhase: resources
-        type: folder
-      - path: models/TextEncoder.mlmodelc
-        buildPhase: resources
-        type: folder
-      - path: models/DecoderStep.mlmodelc
-        buildPhase: resources
-        type: folder
-      - path: models/DecoderPrefill.mlmodelc
-        buildPhase: resources
-        type: folder
-      - path: models/NanocodecDecoder.mlmodelc
-        buildPhase: resources
-        type: folder
+    # Models and constants are no longer bundled — they're downloaded from
+    # Hugging Face into Application Support on first launch. See
+    # MagpieTTSApp/ModelDownloader.swift.
     dependencies:
       - framework: NemoTextProcessing.xcframework
         embed: false

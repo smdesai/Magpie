@@ -34,15 +34,17 @@ final class TTSViewModel: ObservableObject {
     @Published var isPreparing = false
     @Published var isPlaying = false
     @Published var isStreaming = false
+    @Published var isDownloading = false
+    @Published var downloadProgress: DownloadProgress?
     @Published var progress: String = ""
-    @Published var statusMessage: String = "Ready"
+    @Published var statusMessage: String = "Loading models..."
     @Published var errorMessage: String?
     @Published var generationStats: String?
     @Published var hasAudio = false
 
     // MARK: - Data
 
-    let voices: [Voice]
+    @Published var voices: [Voice] = []
     let languages: [Language] = Language.allCases
 
     // MARK: - Private
@@ -52,6 +54,8 @@ final class TTSViewModel: ObservableObject {
     private var audioPlayer: AVAudioPlayer?
     private var audioPlayerDelegate: AudioPlayerDelegate?
     private var isPrepared = false
+    private var hasBootstrapped = false
+    private let downloader = ModelDownloader()
 
     // Streaming playback
     private var audioEngine: AVAudioEngine?
@@ -73,40 +77,68 @@ final class TTSViewModel: ObservableObject {
     private var lastActivityState: TTSActivityAttributes.ContentState?
 
     init() {
-        let bundle = Bundle.main
+        // Voices populate after bootstrap reads speaker_info.json from disk.
+        // A placeholder keeps the picker non-empty so SwiftUI doesn't see a
+        // selection that doesn't match any tag.
+        self.selectedVoice = Voice(id: 0, name: "Default")
+    }
 
-        // constants/ is added as a folder reference → appears as "constants" in bundle
-        let constantsURL =
-            bundle.url(forResource: "constants", withExtension: nil)
-            ?? bundle.resourceURL!.appendingPathComponent("constants")
+    /// One-time async setup. Downloads the model bundle from Hugging Face
+    /// on first launch, then loads constants + CoreML models. Idempotent —
+    /// safe to call from `.task` on the root view (which may re-fire on
+    /// view recreation).
+    func bootstrap() async {
+        guard !hasBootstrapped else { return }
+        hasBootstrapped = true
 
-        let speakers = MagpieTTS.loadSpeakerInfo(constantsDirectory: constantsURL)
+        // 1. Download the bundle if it's not already on disk.
+        if !ModelDownloader.isInstalled() {
+            isDownloading = true
+            downloadProgress = .zero
+            statusMessage = "Downloading model..."
+            do {
+                try await downloader.ensureInstalled { [weak self] progress in
+                    self?.downloadProgress = progress
+                }
+            } catch {
+                isDownloading = false
+                downloadProgress = nil
+                statusMessage = "Download failed"
+                errorMessage = error.localizedDescription
+                hasBootstrapped = false  // allow retry on next view appear
+                return
+            }
+            isDownloading = false
+            downloadProgress = nil
+        }
+
+        // 2. Resolve the install root and populate voices from speaker_info.json.
+        let root = ModelDownloader.rootDirectory()
+        let speakers = MagpieTTS.loadSpeakerInfo(constantsDirectory: root)
         self.voices = speakers.map { Voice(id: $0.index, name: $0.name) }
-        self.selectedVoice = voices.first ?? Voice(id: 0, name: "Default")
+        if let first = self.voices.first { self.selectedVoice = first }
 
-        // .mlmodelc directories are copied to bundle root
-        let buildURL = bundle.resourceURL!
-
-        self.tts = MagpieTTS(
-            constantsDirectory: constantsURL,
-            buildDirectory: buildURL,
+        // 3. Construct + warm up the TTS engine. The HF repo is flat, so the
+        // install root serves as both constantsDirectory and buildDirectory.
+        let engine = MagpieTTS(
+            constantsDirectory: root,
+            buildDirectory: root,
             computeUnits: .cpuAndGPU
         )
+        engine.useMLXLocalTransformer = self.useMLX
+        self.tts = engine
 
-        // Eagerly load models in background so they're ready when user taps Generate
         isPreparing = true
         statusMessage = "Loading models..."
-        Task {
-            do {
-                try await tts?.prepare()
-                isPrepared = true
-                statusMessage = "Ready"
-            } catch {
-                statusMessage = "Model load failed"
-                errorMessage = error.localizedDescription
-            }
-            isPreparing = false
+        do {
+            try await engine.prepare()
+            isPrepared = true
+            statusMessage = "Ready"
+        } catch {
+            statusMessage = "Model load failed"
+            errorMessage = error.localizedDescription
         }
+        isPreparing = false
     }
 
     // MARK: - Actions

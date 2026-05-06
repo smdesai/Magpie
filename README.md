@@ -29,8 +29,6 @@ Magpie/
 ├── COpenJTalk/                      # C bridging headers for OpenJTalk
 ├── OpenJTalk.xcframework/           # Prebuilt OpenJTalk binary (bundled)
 ├── NemoTextProcessing.xcframework/  # Text-processing framework (you compile this)
-├── models/                          # CoreML models (*.mlmodelc, you provide)
-└── constants/                       # Tokenizers, phoneme dicts, speaker embeddings
 ```
 
 ## Prerequisites
@@ -60,40 +58,15 @@ The Xcode project links this framework by path (see `project.yml`), so it must l
 
 ### 3. CoreML Models, Constants, and OpenJTalk.xcframework
 
-The `models/` directory, the `constants/` directory, and `OpenJTalk.xcframework` can all be obtained by following the build instructions at:
+The models and constants are downloaded from:
 
-> https://github.com/smdesai/MagpieTTS
-
-After building, place them at the project root so the layout is:
-
-```
-Magpie/
-├── models/
-│   ├── TextEncoder.mlmodelc/
-│   ├── DecoderPrefill.mlmodelc/
-│   ├── DecoderStep.mlmodelc/
-│   └ NanocodecDecoder.mlmodelc/
-├── constants/
-│   ├── *.npy                   # speaker & audio embeddings
-│   ├── open_jtalk_dic/         # OpenJTalk dictionary
-│   ├── local_transformer/      # MLX weights
-│   └── tokenizer/                     
-│       └── *.json/             # phoneme dicts
-└── OpenJTalk.xcframework/
-    ├── Info.plist
-    ├── ios-arm64/
-    ├── ios-arm64-simulator/
-    └── macos-arm64/
-```
-
-The CoreML models and the `constants/` folder are bundled as app resources via `project.yml`. The app will fail to launch synthesis if any of them are missing.
+> https://huggingface.co/smdesai/magpie-tts-multilingual-357m-coreml
 
 ## Build & Run
 
 ```bash
 # 1. Ensure NemoTextProcessing.xcframework is in the project root
-# 2. Ensure the four *.mlmodelc bundles are in models/
-# 3. Generate the Xcode project
+# 2. Generate the Xcode project
 xcodegen generate
 
 # 4. Open and run

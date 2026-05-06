@@ -1,13 +1,17 @@
+//
+//  NemoTextProcessing.swift
+//  MagpieTTS
+//
+//  Created by Sachin Desai on 3/8/26.
+//
+
 import CNemoTextProcessing
 import Foundation
 
-/// Swift wrapper for NeMo Text Processing (Inverse Text Normalization).
+/// Swift wrapper for NeMo Text Processing.
 ///
-/// Converts spoken-form ASR output to written form:
-/// - "two hundred thirty two" → "232"
-/// - "five dollars and fifty cents" → "$5.50"
-/// - "january fifth twenty twenty five" → "January 5, 2025"
-/// - "period" → "."
+/// ITN (spoken → written): "two hundred" → "200"
+/// TN (written → spoken): "$5.50" → "five dollars and fifty cents"
 public enum NemoTextProcessing {
 
     // MARK: - Normalization
@@ -60,67 +64,18 @@ public enum NemoTextProcessing {
         return String(cString: resultPtr)
     }
 
-    /// Normalize a full sentence with caller-specified options.
+    /// Normalize a full sentence with a configurable max span size.
     ///
     /// - Parameters:
     ///   - input: Sentence containing spoken-form spans
-    ///   - concatCompoundNumbers: When true, consecutive 0-99 number words
-    ///     concatenate (e.g. `"thirty five sixty two"` → `"3562"`,
-    ///     `"seven eighty eight"` → `"788"`) instead of adding.
-    ///   - maxSpanTokens: Maximum consecutive tokens per normalizable span.
-    ///     Pass `0` to use the library default (16).
-    ///   - disableBareSecond: When true, the bare word `"second"` is NOT
-    ///     rewritten to `"2nd"` (issue #22). Compound ordinals like
-    ///     `"twenty second"` → `"22nd"` still convert.
+    ///   - maxSpanTokens: Maximum consecutive tokens per normalizable span (default 16)
     /// - Returns: Sentence with spoken-form spans replaced
-    public static func normalizeSentence(
-        _ input: String,
-        concatCompoundNumbers: Bool = false,
-        maxSpanTokens: UInt32 = 0,
-        disableBareSecond: Bool = false
-    ) -> String {
+    public static func normalizeSentence(_ input: String, maxSpanTokens: UInt32) -> String {
         guard let cString = input.cString(using: .utf8) else {
             return input
         }
 
-        let concatFlag: UInt32 = concatCompoundNumbers ? 1 : 0
-        let bareSecondFlag: UInt32 = disableBareSecond ? 1 : 0
-        guard
-            let resultPtr = nemo_normalize_sentence_with_options(
-                cString, concatFlag, maxSpanTokens, bareSecondFlag
-            )
-        else {
-            return input
-        }
-
-        defer { nemo_free_string(resultPtr) }
-
-        return String(cString: resultPtr)
-    }
-
-    /// Normalize a single spoken-form expression with caller-specified options.
-    ///
-    /// - Parameters:
-    ///   - input: Spoken-form text
-    ///   - concatCompoundNumbers: See `normalizeSentence(_:concatCompoundNumbers:maxSpanTokens:disableBareSecond:)`.
-    ///   - disableBareSecond: See `normalizeSentence(_:concatCompoundNumbers:maxSpanTokens:disableBareSecond:)`.
-    /// - Returns: Written-form text, or original if no normalization applies.
-    public static func normalize(
-        _ input: String,
-        concatCompoundNumbers: Bool = false,
-        disableBareSecond: Bool = false
-    ) -> String {
-        guard let cString = input.cString(using: .utf8) else {
-            return input
-        }
-
-        let concatFlag: UInt32 = concatCompoundNumbers ? 1 : 0
-        let bareSecondFlag: UInt32 = disableBareSecond ? 1 : 0
-        guard
-            let resultPtr = nemo_normalize_with_options(
-                cString, concatFlag, bareSecondFlag
-            )
-        else {
+        guard let resultPtr = nemo_normalize_sentence_with_max_span(cString, maxSpanTokens) else {
             return input
         }
 
@@ -132,132 +87,26 @@ public enum NemoTextProcessing {
     // MARK: - Text Normalization (Written → Spoken)
 
     /// Normalize written-form text to spoken form (TTS preprocessing).
-    ///
-    /// Tries to match the entire input as a single expression.
-    /// Use `tnNormalizeSentence` for inputs containing mixed text.
-    ///
-    /// - Parameter input: Written-form text
-    /// - Returns: Spoken-form text, or original if no normalization applies
     public static func tnNormalize(_ input: String) -> String {
-        guard let cString = input.cString(using: .utf8) else {
-            return input
-        }
-        guard let resultPtr = nemo_tn_normalize(cString) else {
-            return input
-        }
+        guard let cString = input.cString(using: .utf8) else { return input }
+        guard let resultPtr = nemo_tn_normalize(cString) else { return input }
         defer { nemo_free_string(resultPtr) }
         return String(cString: resultPtr)
     }
 
     /// Normalize a full sentence, replacing written-form spans with spoken form.
-    ///
-    /// - Parameter input: Sentence containing written-form spans
-    /// - Returns: Sentence with written-form spans replaced with spoken form
-    ///
-    /// Example:
-    /// ```swift
-    /// let result = NemoTextProcessing.tnNormalizeSentence("I paid $5 for 23 items")
-    /// // result is "I paid five dollars for twenty three items"
-    /// ```
     public static func tnNormalizeSentence(_ input: String) -> String {
-        guard let cString = input.cString(using: .utf8) else {
-            return input
-        }
-        guard let resultPtr = nemo_tn_normalize_sentence(cString) else {
-            return input
-        }
+        guard let cString = input.cString(using: .utf8) else { return input }
+        guard let resultPtr = nemo_tn_normalize_sentence(cString) else { return input }
         defer { nemo_free_string(resultPtr) }
         return String(cString: resultPtr)
     }
 
     /// Normalize a full sentence with a configurable max span size.
-    ///
-    /// - Parameters:
-    ///   - input: Sentence containing written-form spans
-    ///   - maxSpanTokens: Maximum consecutive tokens per normalizable span (default 16)
-    /// - Returns: Sentence with written-form spans replaced with spoken form
     public static func tnNormalizeSentence(_ input: String, maxSpanTokens: UInt32) -> String {
-        guard let cString = input.cString(using: .utf8) else {
-            return input
-        }
+        guard let cString = input.cString(using: .utf8) else { return input }
         guard let resultPtr = nemo_tn_normalize_sentence_with_max_span(cString, maxSpanTokens)
-        else {
-            return input
-        }
-        defer { nemo_free_string(resultPtr) }
-        return String(cString: resultPtr)
-    }
-
-    // MARK: - Language-Specific Text Normalization
-
-    /// Normalize written-form text to spoken form for a specific language.
-    ///
-    /// Supported languages: "en", "fr", "es", "de", "zh", "hi", "ja".
-    /// Falls back to English for unrecognized language codes.
-    ///
-    /// - Parameters:
-    ///   - input: Written-form text
-    ///   - language: ISO 639-1 language code
-    /// - Returns: Spoken-form text, or original if no normalization applies
-    ///
-    /// Example:
-    /// ```swift
-    /// let result = NemoTextProcessing.tnNormalize("123", language: "fr")
-    /// // result is "cent vingt-trois"
-    /// ```
-    public static func tnNormalize(_ input: String, language: String) -> String {
-        guard let inputC = input.cString(using: .utf8),
-            let langC = language.cString(using: .utf8)
-        else {
-            return input
-        }
-        guard let resultPtr = nemo_tn_normalize_lang(inputC, langC) else {
-            return input
-        }
-        defer { nemo_free_string(resultPtr) }
-        return String(cString: resultPtr)
-    }
-
-    /// Normalize a full sentence for a specific language, replacing written-form spans with spoken form.
-    ///
-    /// - Parameters:
-    ///   - input: Sentence containing written-form spans
-    ///   - language: ISO 639-1 language code
-    /// - Returns: Sentence with written-form spans replaced with spoken form
-    public static func tnNormalizeSentence(_ input: String, language: String) -> String {
-        guard let inputC = input.cString(using: .utf8),
-            let langC = language.cString(using: .utf8)
-        else {
-            return input
-        }
-        guard let resultPtr = nemo_tn_normalize_sentence_lang(inputC, langC) else {
-            return input
-        }
-        defer { nemo_free_string(resultPtr) }
-        return String(cString: resultPtr)
-    }
-
-    /// Normalize a full sentence for a specific language with a configurable max span size.
-    ///
-    /// - Parameters:
-    ///   - input: Sentence containing written-form spans
-    ///   - language: ISO 639-1 language code
-    ///   - maxSpanTokens: Maximum consecutive tokens per normalizable span (default 16)
-    /// - Returns: Sentence with written-form spans replaced with spoken form
-    public static func tnNormalizeSentence(_ input: String, language: String, maxSpanTokens: UInt32)
-        -> String
-    {
-        guard let inputC = input.cString(using: .utf8),
-            let langC = language.cString(using: .utf8)
-        else {
-            return input
-        }
-        guard
-            let resultPtr = nemo_tn_normalize_sentence_with_max_span_lang(
-                inputC, langC, maxSpanTokens)
-        else {
-            return input
-        }
+        else { return input }
         defer { nemo_free_string(resultPtr) }
         return String(cString: resultPtr)
     }
