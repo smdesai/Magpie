@@ -660,7 +660,21 @@ public final class MagpieTTS {
     /// Only applies to English for now; other languages pass through unchanged.
     private static func normalizeForTTS(_ text: String, language: Language) -> String {
         guard language == .english else { return text }
-        return NemoTextProcessing.tnNormalizeSentence(text)
+        return NemoTextProcessing.tnNormalizeSentence(foldDashesToAscii(text))
+    }
+
+    /// Replace Unicode dash variants with ASCII hyphen-minus.
+    /// macOS `TextEditor` "smart dashes" rewrite ASCII `-` to U+2013 in date-shaped
+    /// inputs (e.g. "2026-05-06" → "2026–05–06"), which then bypasses NeMo's
+    /// date taggers since they match `\-` only.
+    private static func foldDashesToAscii(_ text: String) -> String {
+        var result = text
+        for dash in ["\u{2010}", "\u{2011}", "\u{2012}", "\u{2013}", "\u{2014}", "\u{2015}", "\u{2212}"] {
+            if result.contains(dash) {
+                result = result.replacingOccurrences(of: dash, with: "-")
+            }
+        }
+        return result
     }
 
     // MARK: - Phoneme Span Masking

@@ -75,7 +75,8 @@ public enum NemoTextProcessing {
             return input
         }
 
-        guard let resultPtr = nemo_normalize_sentence_with_max_span(cString, maxSpanTokens) else {
+        guard let resultPtr = nemo_normalize_sentence_with_options(cString, 0, maxSpanTokens, 0)
+        else {
             return input
         }
 

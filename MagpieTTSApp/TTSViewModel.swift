@@ -8,6 +8,7 @@
 import AVFoundation
 import ActivityKit
 import Combine
+import Darwin
 import SwiftUI
 import UIKit
 
@@ -163,6 +164,15 @@ final class TTSViewModel: ObservableObject {
         )
 
         Task {
+            let tracker = PeakMemoryTracker()
+            await tracker.update(MemoryMonitor.currentFootprintBytes())
+            let samplingTask = Task.detached {
+                while !Task.isCancelled {
+                    await tracker.update(MemoryMonitor.currentFootprintBytes())
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+
             do {
                 let result = try await tts!.generateLong(
                     text: expandedText,
@@ -177,6 +187,10 @@ final class TTSViewModel: ObservableObject {
                     }
                 }
 
+                samplingTask.cancel()
+                await tracker.update(MemoryMonitor.currentFootprintBytes())
+                let peakMB = Double(await tracker.peak) / 1_048_576.0
+
                 audioData = result.wavData
                 hasAudio = true
                 let dur = String(format: "%.1f", result.durationSeconds)
@@ -184,11 +198,13 @@ final class TTSViewModel: ObservableObject {
                 let rtfx = String(
                     format: "%.1f", result.durationSeconds / result.generationTimeSeconds)
                 let lt = String(format: "%.2f", result.localTransformerTimeSeconds)
+                let peak = String(format: "%.0f", peakMB)
                 generationStats =
-                    "\(dur)s audio in \(gen)s (\(rtfx)x RTFx) | LT: \(lt)s [\(result.localTransformerBackend)]"
+                    "\(dur)s audio in \(gen)s (\(rtfx)x RTFx) | LT: \(lt)s [\(result.localTransformerBackend)] | peak \(peak) MB"
                 statusMessage = "Done"
                 progress = ""
             } catch {
+                samplingTask.cancel()
                 errorMessage = error.localizedDescription
                 progress = ""
                 statusMessage = "Error"
@@ -220,6 +236,15 @@ final class TTSViewModel: ObservableObject {
         startLiveActivity(textPreview: expandedText)
 
         Task {
+            let tracker = PeakMemoryTracker()
+            await tracker.update(MemoryMonitor.currentFootprintBytes())
+            let samplingTask = Task.detached {
+                while !Task.isCancelled {
+                    await tracker.update(MemoryMonitor.currentFootprintBytes())
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+
             do {
                 try startStreamingEngine(sampleRate: 22050)
 
@@ -259,6 +284,10 @@ final class TTSViewModel: ObservableObject {
                     }
                 )
 
+                samplingTask.cancel()
+                await tracker.update(MemoryMonitor.currentFootprintBytes())
+                let peakMB = Double(await tracker.peak) / 1_048_576.0
+
                 audioData = result.wavData
                 hasAudio = true
                 let dur = String(format: "%.1f", result.durationSeconds)
@@ -268,13 +297,15 @@ final class TTSViewModel: ObservableObject {
                 let ttfa =
                     result.timeToFirstAudioSeconds > 0
                     ? String(format: "%.2f", result.timeToFirstAudioSeconds) : "-"
-                generationStats = "\(dur)s in \(gen)s (\(rtfx)x) | TTFA: \(ttfa)s"
+                let peak = String(format: "%.0f", peakMB)
+                generationStats = "\(dur)s in \(gen)s (\(rtfx)x) | TTFA: \(ttfa)s | peak \(peak) MB"
                 statusMessage = "Done"
                 progress = ""
 
                 // Wait for all buffers to finish playing
                 await waitForStreamingPlaybackEnd()
             } catch {
+                samplingTask.cancel()
                 errorMessage = error.localizedDescription
                 progress = ""
                 statusMessage = "Error"
@@ -704,5 +735,30 @@ private final class AudioPlayerDelegate: NSObject, AVAudioPlayerDelegate {
     init(onFinish: @escaping () -> Void) { self.onFinish = onFinish }
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         onFinish()
+    }
+}
+
+// MARK: - Memory
+
+enum MemoryMonitor {
+    static func currentFootprintBytes() -> UInt64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? info.phys_footprint : 0
+    }
+}
+
+actor PeakMemoryTracker {
+    private(set) var peak: UInt64 = 0
+
+    func update(_ bytes: UInt64) {
+        if bytes > peak { peak = bytes }
     }
 }
