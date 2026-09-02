@@ -36,7 +36,6 @@ fastlane/screenshots/**/*.png
 fastlane/test_output
 
 # Large / externally-sourced artifacts (see README)
-NemoTextProcessing.xcframework/
 models/
 constants/
 

@@ -28,18 +28,18 @@ Magpie/
 ├── Sources/MagpieTTS/               # Core library (tokenizers, transformer, bridges)
 ├── COpenJTalk/                      # C bridging headers for OpenJTalk
 ├── OpenJTalk.xcframework/           # Prebuilt OpenJTalk binary (bundled)
-├── NemoTextProcessing.xcframework/  # Text-processing framework (you compile this)
+├── NemoTextProcessing.xcframework/  # Prebuilt NemoTextProcessing binary (bundled)
 ```
 
 ## Prerequisites
 
 ### 1. NemoTextProcessing.xcframework
 
-`NemoTextProcessing.xcframework` is **not** checked into this repo. You must build it yourself from:
-
-> https://github.com/FluidInference/text-processing-rs
-
-Follow that repo's build instructions to produce, then place it at the root of this project so the final layout is:
+`NemoTextProcessing.xcframework` (English text normalization, compiled from
+[text-processing-rs](https://github.com/FluidInference/text-processing-rs)) is checked into
+this repo so the package resolves from a plain `git clone` / Swift Package Manager URL. To
+rebuild it, follow that repo's build instructions and replace the directory at the project
+root, keeping this layout:
 
 ```
 Magpie/
@@ -50,11 +50,16 @@ Magpie/
     └── macos-arm64_x86_64/
 ```
 
-### 2. NemoTextProcessing.swift
+`Sources/MagpieTTS/NemoTextProcessing.swift` is the Swift wrapper over its C API and is
+maintained here alongside it.
 
-Copy `NemoTextProcessing.swift` from the same directory containing `NemoTextProcessing.xcframework` to Sources/MagpieTTS
+### 2. Using MagpieTTS as a package
 
-The Xcode project links this framework by path (see `project.yml`), so it must live in the current directory alongside `project.yml`.
+```swift
+.package(url: "https://github.com/smdesai/Magpie", from: "1.0.0")
+// target dependency:
+.product(name: "MagpieTTS", package: "Magpie")
+```
 
 ### 3. CoreML Models, Constants, and OpenJTalk.xcframework
 
