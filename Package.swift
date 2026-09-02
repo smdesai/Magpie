@@ -22,7 +22,7 @@ let package = Package(
         .library(name: "MagpieTTS", targets: ["MagpieTTS"])
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.6")
+        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.6")
     ],
     targets: [
         // Prebuilt OpenJTalk static library (Japanese G2P frontend).
